@@ -768,7 +768,7 @@ class MainActivity : ComponentActivity() {
                                 val info = e.offer(frame, t0)
                                 val ms = System.currentTimeMillis() - t0
                                 procCount++
-                                val diag = "#$procCount ${ms}ms sharp %.0f/%.0f dark %d%%".format(info.sharp, info.maxSharp, (info.dark * 100).toInt())
+                                val diag = "#$procCount ${ms}ms sharp %.0f/%.0f dark %d%% speed %.2f".format(info.sharp, info.maxSharp, (info.dark * 100).toInt(), info.speed)
                                 if (debugSave) synchronized(debugFiles) { debugLog.append(diag + (if (info.newSnap != null) " SNAP ${info.count}" else "") + "\n") }
                                 val snap = info.newSnap
                                 val st = stitcher
@@ -866,7 +866,9 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun onInfo(info: SnapshotCollector.Info, diag: String, thumb: Bitmap?) {
+        val tooFast = info.speed > 0.8
         val hint = when {
+            tooFast -> "Too fast \u2014 slow down so the photos overlap"
             info.dark > 0.4 -> "Shadow or something is covering the page \u2014 keep your hand's shadow and the strap out of view"
             info.sharp < 0.45 * info.maxSharp -> "Too blurry \u2014 slow down or hold steadier"
             info.count == 0 -> "Start at a corner of the page, then sweep slowly in an S"
@@ -879,7 +881,7 @@ class MainActivity : ComponentActivity() {
             if (mode != Mode.SWEEP) return@runOnUiThread
             statusText.text = "${info.count} photos \u00b7 $joined joined" + (if (coverageText.isNotEmpty()) " \u00b7 $coverageText" else "") + "\n$hint\n$diag"
             if (thumb != null) scanView.setMosaic(thumb)
-            scanView.setFootprint(null, info.sharp < 0.45 * info.maxSharp)
+            scanView.setFootprint(null, tooFast || info.sharp < 0.45 * info.maxSharp)
         }
     }
 }

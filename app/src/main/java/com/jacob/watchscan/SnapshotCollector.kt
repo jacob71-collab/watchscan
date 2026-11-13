@@ -23,7 +23,7 @@ import kotlin.math.min
 class SnapshotCollector {
     companion object {
         const val WINDOW_MS = 800L
-        const val MAX_KEEP = 45
+        const val MAX_KEEP = 60
     }
 
     /**
@@ -34,7 +34,7 @@ class SnapshotCollector {
     class Snap(val full: Mat, val thumb: Mat, val sharp: Double, val px: Double, val py: Double, val unc: Double)
 
     /** [dark] = share of the view that is in deep shadow or blocked (0..1). */
-    class Info(val sharp: Double, val maxSharp: Double, val newSnap: Snap?, val count: Int, val dark: Double)
+    class Info(val sharp: Double, val maxSharp: Double, val newSnap: Snap?, val count: Int, val dark: Double, val speed: Double)
 
     val snaps = ArrayList<Snap>()
     private var maxSharp = 0.0
@@ -92,6 +92,14 @@ class SnapshotCollector {
         prevSmall = small
     }
 
+    // Where the last snapshot was taken, and recent speed (fraction of the view per second).
+    private var snapX = 0.0
+    private var snapY = 0.0
+    private var lastT = 0L
+    private var lastX = 0.0
+    private var lastY = 0.0
+    var speed = 0.0; private set
+
     fun offer(frame: Mat, now: Long): Info {
         val w = frame.cols(); val h = frame.rows()
         val cr = Rect(max(0, w / 2 - 300), max(0, h / 2 - 300), min(600, w), min(600, h))
@@ -99,23 +107,43 @@ class SnapshotCollector {
         maxSharp = max(maxSharp * 0.985, sharp)
         if (windowStart == 0L) windowStart = now
         track(frame)
+        val diag = hypot(w.toDouble(), h.toDouble())
+        if (lastT > 0 && now > lastT) {
+            val v = hypot(posX - lastX, posY - lastY) / diag / ((now - lastT) / 1000.0)
+            speed = 0.7 * speed + 0.3 * v
+        }
+        lastT = now; lastX = posX; lastY = posY
 
-        if (cand == null || sharp > candSharp) {
+        // How far the camera has moved since the last snapshot, as a share of the view.
+        val moved = if (snaps.isEmpty()) 0.0 else hypot(posX - snapX, posY - snapY) / diag
+        // Candidate = sharpest view since the last snapshot that still overlaps it well.
+        val keepsOverlap = snaps.isEmpty() || moved <= 0.35
+        if (cand == null || (keepsOverlap && sharp > candSharp)) {
             cand?.release()
             cand = frame.clone()
             candSharp = sharp
             candX = posX; candY = posY; candUnc = unc; candDark = lastDark
         }
+        // Take a snapshot when the camera has moved about a quarter of the view (so neighbours
+        // always overlap, even on a fast sweep), or every WINDOW_MS on a slow one.
+        val due = when {
+            snaps.isEmpty() -> now - windowStart >= 300
+            moved >= 0.22 -> true
+            now - windowStart >= WINDOW_MS && moved >= 0.06 -> true
+            else -> false
+        }
         var made: Snap? = null
-        if (now - windowStart >= WINDOW_MS) {
+        if (due) {
             val c = cand
+            val minSharp = if (moved >= 0.3) 0.3 else 0.45 // moving fast: accept a softer view rather than leave a gap
             // Skip views mostly covered by shadow or blocked: they add little and confuse the joining.
-            if (c != null && candSharp >= 0.45 * maxSharp && candDark < 0.55 && snaps.size < MAX_KEEP) {
+            if (c != null && candSharp >= minSharp * maxSharp && candDark < 0.55 && snaps.size < MAX_KEEP) {
                 val sig = signature(c)
                 val prev = lastSig
                 if (prev == null || difference(sig, prev) > 7.0) {
                     made = makeSnap(c, candSharp)
                     snaps.add(made)
+                    snapX = candX; snapY = candY
                     prev?.release()
                     lastSig = sig
                 } else {
@@ -127,7 +155,7 @@ class SnapshotCollector {
             candSharp = 0.0
             windowStart = now
         }
-        return Info(sharp, maxSharp, made, snaps.size, lastDark)
+        return Info(sharp, maxSharp, made, snaps.size, lastDark, speed)
     }
 
     /** Small blurred thumbnail used to spot near-duplicate snapshots. */
