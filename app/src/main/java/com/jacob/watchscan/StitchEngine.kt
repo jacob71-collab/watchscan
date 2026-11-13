@@ -52,7 +52,11 @@ class StitchEngine {
         val jpeg: ByteArray, val w: Int, val h: Int,
         val pts: Array<Point>, val des: Mat, val thumb: Mat,
         val pos: Point?, val unc: Double,       // tracked camera position (stored-photo px)
+        val wthumb: Mat,                        // how much this photo can contribute, per spot (thumb size)
     )
+
+    /** Live coverage map: RGB image plus how much of the page is well covered / missing. */
+    class Coverage(val rgb: Mat, val pageFound: Boolean, val goodPct: Int, val weakPct: Int, val missingPct: Int)
 
     private class Edge(val j: Int, val i: Int, val pj: Array<Point>, val pi: Array<Point>)
 
@@ -69,8 +73,8 @@ class StitchEngine {
 
     // ------------------------------------------------------------------ adding photos
 
-    /** Adds a snapshot (full-res grayscale). Returns the live preview of the sheet. */
-    fun add(frame: Mat, px: Double = Double.NaN, py: Double = Double.NaN, unc: Double = 0.0): Mat? {
+    /** Adds a snapshot (full-res grayscale). Returns the live coverage map. */
+    fun add(frame: Mat, px: Double = Double.NaN, py: Double = Double.NaN, unc: Double = 0.0): Coverage? {
         val s = min(1.0, STORE_LONG.toDouble() / max(frame.cols(), frame.rows()))
         val full = Mat()
         if (s < 1.0) Imgproc.resize(frame, full, Size(frame.cols() * s, frame.rows() * s), 0.0, 0.0, Imgproc.INTER_AREA)
@@ -94,7 +98,9 @@ class StitchEngine {
         Imgproc.resize(full, thumb, Size(max(8.0, w * ts), max(8.0, h * ts)), 0.0, 0.0, Imgproc.INTER_AREA)
         val i = imgs.size
         val pos = if (px.isNaN()) null else Point(px * s, py * s)
-        imgs.add(Img(encodeJpeg(full, 92), w, h, pts, des, thumb, pos, unc * s))
+        val wthumb = centrality(thumb.cols(), thumb.rows())
+        litWeight(thumb).also { Core.multiply(wthumb, it, wthumb); it.release() }
+        imgs.add(Img(encodeJpeg(full, 92), w, h, pts, des, thumb, pos, unc * s, wthumb))
         full.release()
 
         // Candidates: the last few photos, plus any placed near where the previous one is.
@@ -112,10 +118,7 @@ class StitchEngine {
         cands.remove(i)
         for (j in cands) link(i, j)?.let { edges.add(it) }
         solve()
-        if (placedH.isEmpty()) return null
-        val (pv, valid, _) = compose(300, full = false)
-        valid.release()
-        return pv
+        return coverage(i)
     }
 
     /** Strictly verified correspondences between photos i (new) and j, or null. */
@@ -428,6 +431,82 @@ class StitchEngine {
         return best?.let { PageDetector.order(it) }
     }
 
+    // ------------------------------------------------------------------ live coverage map
+
+    /**
+     * The page so far, coloured by how well each spot has been captured:
+     * red = not captured (or only in shadow / at a photo's edge), yellow = weak, green = good.
+     * Once the paper's outline is visible, everything inside it counts, so gaps show up red.
+     */
+    private fun coverage(latest: Int): Coverage? {
+        if (placedH.isEmpty()) return null
+        val (img, valid, t) = compose(320, full = false)
+        val rows = img.rows(); val cols = img.cols(); val size = img.size()
+        val ws = Mat.zeros(rows, cols, CvType.CV_32F); val wi = Mat()
+        for ((id, h) in placedH) {
+            val im = imgs[id]
+            val f = im.w.toDouble() / im.wthumb.cols()
+            val m = (t * h * H(doubleArrayOf(f, 0.0, 0.0, 0.0, f, 0.0, 0.0, 0.0, 1.0))).toMat64()
+            Imgproc.warpPerspective(im.wthumb, wi, m, size, Imgproc.INTER_LINEAR)
+            Core.add(ws, wi, ws)
+            m.release()
+        }
+        wi.release()
+        // Paper outline, found on a larger composite.
+        var quad: Array<Point>? = null
+        val (big, bvalid, tb) = compose(800, full = false)
+        try {
+            findPaper(big, bvalid)?.let { q ->
+                val toP = t * tb.inv()
+                quad = q.map { Point(toP.mapX(it.x, it.y), toP.mapY(it.x, it.y)) }.toTypedArray()
+            }
+        } catch (_: Throwable) {
+        }
+        big.release(); bvalid.release()
+        val n = rows * cols
+        val pm = ByteArray(n)
+        val qd = quad
+        if (qd != null) {
+            val pageMask = Mat.zeros(rows, cols, CvType.CV_8UC1)
+            Imgproc.fillConvexPoly(pageMask, org.opencv.core.MatOfPoint(*qd.map { Point(it.x, it.y) }.toTypedArray()), Scalar(255.0))
+            pageMask.get(0, 0, pm); pageMask.release()
+        }
+        val g = ByteArray(n); img.get(0, 0, g)
+        val v = ByteArray(n); valid.get(0, 0, v)
+        val w = FloatArray(n); ws.get(0, 0, w)
+        img.release(); valid.release(); ws.release()
+        val out = ByteArray(n * 3)
+        var good = 0; var weak = 0; var missing = 0
+        for (i in 0 until n) {
+            val gray = g[i].toInt() and 0xff
+            val inPage = if (qd != null) pm[i].toInt() != 0 else v[i].toInt() != 0
+            var r: Int; var gr: Int; var b: Int
+            if (!inPage) {
+                r = gray * 35 / 100; gr = r; b = r
+            } else if (w[i] < 0.15f) {
+                missing++; r = (gray * 40 + 255 * 60) / 100; gr = gray * 40 / 100 + 20; b = gray * 40 / 100 + 20
+            } else if (w[i] < 0.8f) {
+                weak++; r = (gray * 55 + 255 * 45) / 100; gr = (gray * 55 + 200 * 45) / 100; b = gray * 55 / 100
+            } else {
+                good++; r = gray * 80 / 100; gr = (gray * 80 + 255 * 20) / 100; b = gray * 80 / 100
+            }
+            out[3 * i] = r.coerceIn(0, 255).toByte(); out[3 * i + 1] = gr.coerceIn(0, 255).toByte(); out[3 * i + 2] = b.coerceIn(0, 255).toByte()
+        }
+        val rgb = Mat(rows, cols, CvType.CV_8UC3); rgb.put(0, 0, out)
+        if (qd != null) {
+            Imgproc.polylines(rgb, listOf(org.opencv.core.MatOfPoint(*qd.map { Point(it.x, it.y) }.toTypedArray())), true, Scalar(0.0, 220.0, 255.0), 2)
+        }
+        // Outline of the newest photo, so you can see where you are.
+        placedH[latest]?.let { h ->
+            val im = imgs[latest]
+            val c = listOf(0.0 to 0.0, im.w.toDouble() to 0.0, im.w.toDouble() to im.h.toDouble(), 0.0 to im.h.toDouble())
+                .map { (x, y) -> val m = t * h; Point(m.mapX(x, y), m.mapY(x, y)) }
+            Imgproc.polylines(rgb, listOf(org.opencv.core.MatOfPoint(*c.toTypedArray())), true, Scalar(255.0, 255.0, 255.0), 2)
+        }
+        val tot = max(1, good + weak + missing)
+        return Coverage(rgb, qd != null, 100 * good / tot, 100 * weak / tot, 100 * missing / tot)
+    }
+
     // ------------------------------------------------------------------ multi-frame fusion
 
     /** Weight that favours the middle of a photo over its edges. */
@@ -608,7 +687,7 @@ class StitchEngine {
         edges.joinToString(" ") { "${it.j}-${it.i}(${it.pi.size})" }
 
     fun release() {
-        for (im in imgs) { im.des.release(); im.thumb.release() }
+        for (im in imgs) { im.des.release(); im.thumb.release(); im.wthumb.release() }
         imgs.clear(); edges.clear(); placedH.clear()
     }
 }

@@ -101,7 +101,9 @@ class MainActivity : ComponentActivity() {
     @Volatile private var engine: SnapshotCollector? = null
     @Volatile private var stitcher: StitchEngine? = null
     @Volatile private var joined = 0
-    @Volatile private var corners = 0
+    @Volatile private var coverageText = ""
+    @Volatile private var pageFound = false
+    @Volatile private var missingPct = 100
     private var lastZip: android.net.Uri? = null
     private val stitchExec = Executors.newSingleThreadExecutor()
     private var yBuf: ByteArray? = null
@@ -191,7 +193,7 @@ class MainActivity : ComponentActivity() {
         val root = FrameLayout(this)
         root.setBackgroundColor(Color.BLACK)
         scanView = ScanView(this)
-        scanView.setOnClickListener { focusCentre() }
+        scanView.setOnClickListener { focusCentre(); scanView.toggleBigMap() }
         root.addView(scanView, FrameLayout.LayoutParams(-1, -1))
 
         statusText = TextView(this).apply {
@@ -476,7 +478,7 @@ class MainActivity : ComponentActivity() {
         engine = SnapshotCollector()
         stitcher = StitchEngine()
         joined = 0
-        corners = 0
+        coverageText = ""; pageFound = false; missingPct = 100
         runOnUiThread { scanView.clearOverlays() }
         enterMode(Mode.SWEEP)
     }
@@ -734,11 +736,14 @@ class MainActivity : ComponentActivity() {
                                     stitchExec.execute {
                                         try {
                                             if (stitcher === st) {
-                                                val pv = st.add(snap.full, snap.px, snap.py, snap.unc)
+                                                val cov = st.add(snap.full, snap.px, snap.py, snap.unc)
                                                 joined = st.joined
-                                                if (pv != null) {
-                                                    val b = Bitmap.createBitmap(pv.cols(), pv.rows(), Bitmap.Config.ARGB_8888)
-                                                    Utils.matToBitmap(pv, b); pv.release()
+                                                if (cov != null) {
+                                                    coverageText = if (cov.pageFound) "page ${cov.goodPct}% good \u00b7 ${cov.missingPct}% missing"
+                                                        else "page edges not seen yet"
+                                                    pageFound = cov.pageFound; missingPct = cov.missingPct + cov.weakPct / 2
+                                                    val b = Bitmap.createBitmap(cov.rgb.cols(), cov.rgb.rows(), Bitmap.Config.ARGB_8888)
+                                                    Utils.matToBitmap(cov.rgb, b); cov.rgb.release()
                                                     runOnUiThread { if (mode == Mode.SWEEP) scanView.setMosaic(b) }
                                                 }
                                             }
@@ -825,12 +830,14 @@ class MainActivity : ComponentActivity() {
             info.dark > 0.4 -> "Shadow or something is covering the page \u2014 keep your hand's shadow and the strap out of view"
             info.sharp < 0.45 * info.maxSharp -> "Too blurry \u2014 slow down or hold steadier"
             info.count == 0 -> "Start at a corner of the page, then sweep slowly in an S"
-            else -> "Sweep in an S, a little past the paper's edges; tap Done when covered"
+            !pageFound -> "Sweep in an S, a little past the paper's edges (tap screen for a big map)"
+            missingPct > 5 -> "Sweep over the red and yellow areas on the map (tap screen to enlarge)"
+            else -> "Page covered \u2014 tap Done"
         }
         if (info.newSnap != null) vibrate(15)
         runOnUiThread {
             if (mode != Mode.SWEEP) return@runOnUiThread
-            statusText.text = "${info.count} photos \u00b7 $joined joined\n$hint\n$diag"
+            statusText.text = "${info.count} photos \u00b7 $joined joined" + (if (coverageText.isNotEmpty()) " \u00b7 $coverageText" else "") + "\n$hint\n$diag"
             if (thumb != null) scanView.setMosaic(thumb)
             scanView.setFootprint(null, info.sharp < 0.45 * info.maxSharp)
         }

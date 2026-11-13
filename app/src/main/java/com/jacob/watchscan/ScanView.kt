@@ -17,6 +17,10 @@ class ScanView(context: Context) : View(context) {
     private var mosaic: Bitmap? = null
     private var footprint: FloatArray? = null
     private var lostFlag = false
+    private var bigMap = false
+
+    /** Tap: switch between a small corner map and a big one filling the screen. */
+    fun toggleBigMap() { if (mosaic != null) { bigMap = !bigMap; invalidate() } }
 
     private val bmpPaint = Paint(Paint.FILTER_BITMAP_FLAG)
     private val line = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE; strokeWidth = 4f }
@@ -30,7 +34,7 @@ class ScanView(context: Context) : View(context) {
 
     fun setFootprint(f: FloatArray?, lost: Boolean) { footprint = f; lostFlag = lost; invalidate() }
 
-    fun clearOverlays() { mosaic = null; footprint = null; lostFlag = false; invalidate() }
+    fun clearOverlays() { mosaic = null; footprint = null; lostFlag = false; bigMap = false; invalidate() }
 
     private fun fit(bw: Int, bh: Int, maxW: Float, maxH: Float, cx: Float, cy: Float, out: RectF) {
         val s = min(maxW / bw, maxH / bh)
@@ -54,8 +58,9 @@ class ScanView(context: Context) : View(context) {
         }
 
         val m = mosaic ?: return
-        // Page-so-far preview on the right, vertically centred (safe on round screens).
-        fit(m.width, m.height, width * 0.36f, height * 0.42f, width * 0.93f - width * 0.18f, height / 2f, r)
+        // Coverage map: small on the right (vertically centred, safe on round screens), or big.
+        if (bigMap) fit(m.width, m.height, width * 0.86f, height * 0.62f, width / 2f, height * 0.52f, r)
+        else fit(m.width, m.height, width * 0.36f, height * 0.42f, width * 0.93f - width * 0.18f, height / 2f, r)
         fill.color = Color.argb(170, 0, 0, 0)
         canvas.drawRect(r.left - 4, r.top - 4, r.right + 4, r.bottom + 4, fill)
         canvas.drawBitmap(m, null, r, bmpPaint)
