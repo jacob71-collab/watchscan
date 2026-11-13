@@ -120,6 +120,13 @@ class MainActivity : ComponentActivity() {
     private val useFront get() = prefs.getBoolean("front", false)
     private val highRes get() = prefs.getBoolean("high_res", true)
     private val torch get() = prefs.getBoolean("torch", false)
+    private val debugSave get() = prefs.getBoolean("debug", false)
+
+    // Test-frame recording (Settings -> Save test frames)
+    private val debugFiles = ArrayList<Pair<String, ByteArray>>()
+    private val debugLog = StringBuilder()
+    private var lastDebugMs = 0L
+    private var procCount = 0
     private val saveScans get() = prefs.getBoolean("save", true)
 
     // ---------------------------------------------------------------- lifecycle
@@ -264,6 +271,9 @@ class MainActivity : ComponentActivity() {
             val c = camera
             if (c != null && c.cameraInfo.hasFlashUnit()) c.cameraControl.enableTorch(torch)
             else if (torch) toast("This camera has no flashlight.")
+        }, lp())
+        settingsBox.addView(makeButton("Save test frames: " + if (debugSave) "on" else "off") {
+            prefs.edit().putBoolean("debug", !debugSave).apply(); rebuildSettings()
         }, lp())
         settingsBox.addView(makeButton("Save scans: " + if (saveScans) "on" else "off") {
             prefs.edit().putBoolean("save", !saveScans).apply(); rebuildSettings()
@@ -415,6 +425,14 @@ class MainActivity : ComponentActivity() {
         workExec.execute {
             try {
                 val e = ScanEngine()
+                synchronized(debugFiles) {
+                    debugFiles.clear(); debugLog.setLength(0); procCount = 0; lastDebugMs = 0L
+                    if (debugSave) {
+                        debugFiles.add("00_overview.jpg" to encodeJpeg(frame, 92))
+                        debugLog.append("camera: $camDesc\nmodel: ${Build.MANUFACTURER} ${Build.MODEL}, Android ${Build.VERSION.RELEASE}\n")
+                        debugLog.append("quad: " + quad.joinToString(" ") { "%.0f,%.0f".format(it.x, it.y) } + "\n")
+                    }
+                }
                 e.start(frame, quad)
                 engine = e
                 runOnUiThread {
@@ -450,6 +468,10 @@ class MainActivity : ComponentActivity() {
 
                 if (saveScans) {
                     try { saveJpeg(encodeJpeg(result, 92)) } catch (t: Throwable) { /* not fatal */ }
+                }
+                if (debugSave) {
+                    setStatus("Saving test frames\u2026")
+                    try { writeDebugZip(result) } catch (t: Throwable) { /* not fatal */ }
                 }
 
                 val key = apiKey
@@ -660,8 +682,13 @@ class MainActivity : ComponentActivity() {
                     workExec.execute {
                         try {
                             if (mode == Mode.SWEEP && engine === e) {
+                                val t0 = System.currentTimeMillis()
                                 val info = e.process(frame)
-                                onInfo(info)
+                                val ms = System.currentTimeMillis() - t0
+                                procCount++
+                                val diag = "#$procCount ${ms}ms ${e.lastHow} m${e.lastMatches}/i${e.lastInliers} f%.2f".format(info.f)
+                                if (debugSave) recordDebug(frame, diag, info, e.lastSharp)
+                                onInfo(info, diag)
                             }
                         } catch (t: Throwable) {
                             setStatus("Tracking error: ${t.message}")
@@ -700,7 +727,52 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun onInfo(info: ScanEngine.Info) {
+    private fun recordDebug(frame: Mat, diag: String, info: ScanEngine.Info, sharp: Double) {
+        synchronized(debugFiles) {
+            debugLog.append("$diag sharp=%.0f acc=${info.accepted} upd=${info.updated} good=${info.good}/${info.total}\n".format(sharp))
+            val now = System.currentTimeMillis()
+            if (debugFiles.size < 17 && now - lastDebugMs > 1500) {
+                lastDebugMs = now
+                debugFiles.add("%02d_frame_%03d.jpg".format(debugFiles.size, procCount) to encodeJpeg(frame, 90))
+            }
+        }
+    }
+
+    /** Writes the recorded test frames + log as one zip in Download/WatchScan. */
+    private fun writeDebugZip(result: Mat?) {
+        val files: List<Pair<String, ByteArray>>
+        val log: String
+        synchronized(debugFiles) {
+            if (debugFiles.isEmpty()) return
+            files = ArrayList(debugFiles)
+            log = debugLog.toString()
+            debugFiles.clear()
+        }
+        val bos = java.io.ByteArrayOutputStream()
+        java.util.zip.ZipOutputStream(bos).use { z ->
+            fun put(name: String, data: ByteArray) {
+                z.putNextEntry(java.util.zip.ZipEntry(name)); z.write(data); z.closeEntry()
+            }
+            for ((n, d) in files) put(n, d)
+            if (result != null) put("99_result.jpg", encodeJpeg(result, 90))
+            put("log.txt", log.toByteArray())
+        }
+        val name = "watchscan_test_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date()) + ".zip"
+        if (Build.VERSION.SDK_INT >= 29) {
+            val values = ContentValues().apply {
+                put(MediaStore.MediaColumns.DISPLAY_NAME, name)
+                put(MediaStore.MediaColumns.MIME_TYPE, "application/zip")
+                put(MediaStore.MediaColumns.RELATIVE_PATH, "Download/WatchScan")
+            }
+            val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values) ?: return
+            contentResolver.openOutputStream(uri)?.use { it.write(bos.toByteArray()) }
+        } else {
+            val dir = getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS) ?: return
+            java.io.File(dir, name).writeBytes(bos.toByteArray())
+        }
+    }
+
+    private fun onInfo(info: ScanEngine.Info, diag: String) {
         val pct = 100 * info.good / max(1, info.total)
         val hint = when {
             !info.ok -> "Lost the page — move back a little so more text is visible"
@@ -712,7 +784,7 @@ class MainActivity : ComponentActivity() {
         val e = engine ?: return
         runOnUiThread {
             if (mode != Mode.SWEEP) return@runOnUiThread
-            statusText.text = "$pct% captured\n$hint"
+            statusText.text = "$pct% captured\n$hint\n$diag"
             scanView.setOutline(info.pageInFrame, Color.CYAN)
             scanView.setGrid(info.status, info.cols, info.rows, e.rh.toFloat() / e.rw, info.footprint)
             if (info.done) {

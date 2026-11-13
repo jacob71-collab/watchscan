@@ -101,6 +101,7 @@ class ScanEngine {
     private var lost = 0
     private var maxSharp = 0.0
     var started = false; private set
+    var lastSharp = 0.0; private set
 
     fun start(frame: Mat, quad: Array<Point>) {
         val (w, h) = pageSize(quad)
@@ -144,6 +145,11 @@ class ScanEngine {
         val cx = quad.sumOf { it.x } / 4
         val cy = quad.sumOf { it.y } / 4
         s = min(1.0, hq.localScale(cx, cy))
+        feats(frame, s)?.let { fa ->
+            prevPts = fa.pts
+            prevDes = fa.des
+            prevH = hq * H.resize(fa.sw.toDouble() / frame.cols(), fa.sh.toDouble() / frame.rows()).inv()
+        }
         lost = 0
         maxSharp = 0.0
         started = true
@@ -165,48 +171,102 @@ class ScanEngine {
         return Rect(x0, y0, x1 - x0, y1 - y0)
     }
 
-    /** Locates a full-resolution frame on the reference. Returns frame -> ref. */
-    private fun register(frame: Mat, scale: Double): H? {
-        val w = frame.cols()
-        val h = frame.rows()
-        val sw = max(32, (w * scale).toInt())
-        val sh = max(32, (h * scale).toInt())
+    private class Feat(val pts: Array<Point>, val des: Mat, val sw: Int, val sh: Int)
+
+    // Last successfully located frame: its features (at its working scale) and small -> ref mapping.
+    private var prevPts: Array<Point>? = null
+    private var prevDes: Mat? = null
+    private var prevH: H? = null
+
+    // Diagnostics for the last process() call
+    var lastHow = ""; private set
+    var lastMatches = 0; private set
+    var lastInliers = 0; private set
+
+    private fun feats(frame: Mat, scale: Double): Feat? {
+        val sw = max(32, (frame.cols() * scale).toInt())
+        val sh = max(32, (frame.rows() * scale).toInt())
         val small = Mat()
         Imgproc.resize(frame, small, Size(sw.toDouble(), sh.toDouble()), 0.0, 0.0, Imgproc.INTER_AREA)
         val kp = MatOfKeyPoint()
         val des = Mat()
         orb.detectAndCompute(small, Mat(), kp, des)
         small.release()
-        val kps = kp.toArray()
-        if (des.empty() || kps.size < 30) return null
+        val pts = kp.toArray().map { it.pt }.toTypedArray()
+        if (des.empty() || pts.size < 30) { des.release(); return null }
+        return Feat(pts, des, sw, sh)
+    }
+
+    /** Homography taking feature coords of [fa] onto the coords of (ptsB, desB). */
+    private fun match(fa: Feat, ptsB: Array<Point>, desB: Mat): H? {
+        if (desB.empty() || ptsB.size < 20) return null
         val knn = ArrayList<MatOfDMatch>()
-        matcher.knnMatch(des, refDes, knn, 2)
+        matcher.knnMatch(fa.des, desB, knn, 2)
         val src = ArrayList<Point>()
         val dst = ArrayList<Point>()
         for (mm in knn) {
             val a = mm.toArray()
             if (a.size == 2 && a[0].distance < 0.8f * a[1].distance) {
-                src.add(kps[a[0].queryIdx].pt)
-                dst.add(refPts[a[0].trainIdx])
+                src.add(fa.pts[a[0].queryIdx])
+                dst.add(ptsB[a[0].trainIdx])
             }
         }
-        des.release()
+        lastMatches = max(lastMatches, src.size)
         if (src.size < 20) return null
         val mask = Mat()
         val hm = Calib3d.findHomography(MatOfPoint2f(*src.toTypedArray()), MatOfPoint2f(*dst.toTypedArray()), Calib3d.RANSAC, 3.0, mask)
         if (hm.empty()) return null
         val inl = Core.countNonZero(mask)
+        lastInliers = max(lastInliers, inl)
         if (inl < 20 || inl < 0.2 * src.size) return null
-        val hs = H.fromMat(hm)
-        // Sanity: frame outline must map to a plausible convex quad.
-        val xs = doubleArrayOf(0.0, sw.toDouble(), sw.toDouble(), 0.0)
-        val ys = doubleArrayOf(0.0, 0.0, sh.toDouble(), sh.toDouble())
-        val px = DoubleArray(4) { hs.mapX(xs[it], ys[it]) }
-        val py = DoubleArray(4) { hs.mapY(xs[it], ys[it]) }
-        if (!isConvex(px, py)) return null
+        return H.fromMat(hm)
+    }
+
+    /** Frame outline must map to a plausible convex quad on the reference. */
+    private fun sane(hr: H, w: Int, h: Int): Boolean {
+        val xs = doubleArrayOf(0.0, w.toDouble(), w.toDouble(), 0.0)
+        val ys = doubleArrayOf(0.0, 0.0, h.toDouble(), h.toDouble())
+        val px = DoubleArray(4) { hr.mapX(xs[it], ys[it]) }
+        val py = DoubleArray(4) { hr.mapY(xs[it], ys[it]) }
+        if (!isConvex(px, py)) return false
         val area = polyArea(px, py)
-        if (area < 0.005 * rw * rh || area > 4.0 * rw * rh) return null
-        return hs * H.resize(sw.toDouble() / w, sh.toDouble() / h)
+        return area >= 0.005 * rw * rh && area <= 4.0 * rw * rh
+    }
+
+    /**
+     * Locates a full-resolution frame on the reference (returns frame -> ref).
+     * Tries the page reference first, then the previous located frame ("chain"),
+     * which still works when the frame looks too different from the blurry overview.
+     */
+    private fun register(frame: Mat, scale: Double): H? {
+        val w = frame.cols()
+        val h = frame.rows()
+        val fa = feats(frame, scale) ?: run { lastHow = "few features"; return null }
+        val down = H.resize(fa.sw.toDouble() / w, fa.sh.toDouble() / h)
+        var hr: H? = match(fa, refPts, refDes)?.let { it * down }
+        if (hr != null && !sane(hr, w, h)) hr = null
+        if (hr != null) {
+            lastHow = "page"
+        } else {
+            val pp = prevPts; val pd = prevDes; val ph = prevH
+            if (pp != null && pd != null && ph != null) {
+                val hcp = match(fa, pp, pd)
+                if (hcp != null) {
+                    val cand = ph * hcp * down
+                    if (sane(cand, w, h)) { hr = cand; lastHow = "chain" }
+                }
+            }
+        }
+        if (hr == null) {
+            if (lastHow != "few features") lastHow = "no match"
+            fa.des.release()
+            return null
+        }
+        prevDes?.release()
+        prevPts = fa.pts
+        prevDes = fa.des
+        prevH = hr * down.inv()
+        return hr
     }
 
     /** ECC refinement of frame -> canvas against the canvas at reference resolution. */
@@ -249,6 +309,8 @@ class ScanEngine {
         val sharp = laplaceVar(frame.submat(cr))
         maxSharp = max(maxSharp * 0.97, sharp)
 
+        lastHow = ""; lastMatches = 0; lastInliers = 0
+        lastSharp = sharp
         val tries = if (lost < 2) listOf(s) else listOf(s, s * 0.6, s * 1.6, s * 0.35)
         var hr: H? = null
         for (sc in tries) {
@@ -382,6 +444,7 @@ class ScanEngine {
     fun release() {
         if (!started) return
         ref.release(); refDes.release(); canvas.release(); canvasSmall.release()
+        prevDes?.release(); prevDes = null
         started = false
     }
 }
