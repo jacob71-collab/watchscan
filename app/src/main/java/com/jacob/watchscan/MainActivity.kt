@@ -97,7 +97,7 @@ class MainActivity : ComponentActivity() {
     @Volatile private var lastFocusMs = 0L
 
 
-    @Volatile private var engine: MosaicEngine? = null
+    @Volatile private var engine: SnapshotCollector? = null
     private var yBuf: ByteArray? = null
     private var qrDetector: QRCodeDetector? = null
     private var qrCounter = 0
@@ -358,7 +358,7 @@ class MainActivity : ComponentActivity() {
                 Mode.READY -> {
                     scanView.setStill(null); scanView.clearOverlays()
                     mainButton.text = "Start"
-                    statusText.text = "Hold the watch close over one corner of the page, then tap Start"
+                    statusText.text = "Hold the watch close over the top-left of the page, tap Start, then sweep in an S"
                 }
                 Mode.SWEEP -> {
                     mainButton.text = "Done"
@@ -405,7 +405,7 @@ class MainActivity : ComponentActivity() {
             }
         }
         vibrate(40)
-        engine = MosaicEngine()
+        engine = SnapshotCollector()
         runOnUiThread { scanView.clearOverlays() }
         enterMode(Mode.SWEEP)
     }
@@ -414,54 +414,50 @@ class MainActivity : ComponentActivity() {
         val e = engine ?: return
         if (mode != Mode.SWEEP) return
         enterMode(Mode.FINISHING)
-        setStatus("Building the scan…")
+        setStatus("Preparing photos\u2026")
         workExec.execute {
             try {
-                val result = e.result()
-                // Preview of the finished scan
-                val ps = min(1.0, 900.0 / max(result.cols(), result.rows()))
-                val prev = Mat()
-                Imgproc.resize(result, prev, CvSize(result.cols() * ps, result.rows() * ps), 0.0, 0.0, Imgproc.INTER_AREA)
-                val bmp = Bitmap.createBitmap(prev.cols(), prev.rows(), Bitmap.Config.ARGB_8888)
-                Utils.matToBitmap(prev, bmp)
-                prev.release()
+                if (e.snaps.isEmpty()) {
+                    showAnswer("No photos were taken. Hold the watch steady over the page for a moment, then sweep slowly. Tap New scan to try again.")
+                    return@execute
+                }
+                val sheet = e.contactSheet()
+                val bmp = Bitmap.createBitmap(sheet.cols(), sheet.rows(), Bitmap.Config.ARGB_8888)
+                Utils.matToBitmap(sheet, bmp)
                 runOnUiThread { scanView.clearOverlays(); scanView.setStill(bmp) }
-
                 if (saveScans) {
-                    try { saveJpeg(encodeJpeg(result, 92)) } catch (t: Throwable) { /* not fatal */ }
+                    try { saveJpeg(encodeJpeg(sheet, 90)) } catch (t: Throwable) { /* not fatal */ }
                 }
                 if (debugSave) {
-                    setStatus("Saving test frames\u2026")
-                    try { writeDebugZip(result) } catch (t: Throwable) { /* not fatal */ }
+                    setStatus("Saving test photos\u2026")
+                    synchronized(debugFiles) {
+                        debugFiles.clear()
+                        e.snaps.forEachIndexed { i, sn -> debugFiles.add("%02d_photo.jpg".format(i + 1) to sn.jpeg) }
+                    }
+                    try { writeDebugZip(sheet) } catch (t: Throwable) { /* not fatal */ }
                 }
+                sheet.release()
 
                 val key = apiKey
                 if (key.isEmpty()) {
-                    result.release()
                     showAnswer(
-                        "Scan finished" + (if (saveScans) " and saved to Pictures/WatchScan." else ".") +
-                            "\n\nTo get answers from Claude, add your API key in settings (⚙)."
+                        "${e.snaps.size} photos taken" + (if (saveScans) " (overview saved to Pictures/WatchScan)." else ".") +
+                            "\n\nTo get answers from Claude, add your API key in settings (\u2699)."
                     )
                     return@execute
                 }
-                val closeUps = try { e.closeUps(4) } catch (_: Throwable) { emptyList() }
-                val (tw, th) = sizeForClaude(result.cols(), result.rows())
-                val small = Mat()
-                Imgproc.resize(result, small, CvSize(tw.toDouble(), th.toDouble()), 0.0, 0.0, Imgproc.INTER_AREA)
-                result.release()
-                val jpeg = encodeJpeg(small, 88)
-                small.release()
+                val photos = e.toSend()
                 val modelName = ClaudeClient.MODELS.firstOrNull { it.first == model }?.second ?: model
-                setStatus("Asking Claude ($modelName)…")
+                setStatus("Sending ${photos.size} photos to Claude ($modelName)\u2026")
                 val answer = try {
-                    ClaudeClient.ask(key, model, jpeg, closeUps)
+                    ClaudeClient.ask(key, model, photos)
                 } catch (t: Throwable) {
                     "Couldn't get an answer.\n\n${t.message ?: t.javaClass.simpleName}\n\nCheck the watch's internet connection, then tap New scan to try again."
                 }
                 vibrate(120)
                 showAnswer(answer)
             } catch (t: Throwable) {
-                showAnswer("Something went wrong while building the scan: ${t.message}")
+                showAnswer("Something went wrong: ${t.message}")
             }
         }
     }
@@ -606,7 +602,7 @@ class MainActivity : ComponentActivity() {
         frameCount++
         if (frameCount == 1) {
             camDesc = "${up.cols()}x${up.rows()}, " + camDesc
-            if (mode == Mode.READY) setStatus("Camera $camDesc\nHold the watch close over one corner of the page, then tap Start")
+            if (mode == Mode.READY) setStatus("Camera $camDesc\nHold the watch close over the top-left of the page, tap Start, then sweep in an S")
         }
         // Cameras without continuous autofocus need a nudge every few seconds.
         if (!continuousAf && (mode == Mode.SWEEP || mode == Mode.READY) &&
@@ -631,17 +627,17 @@ class MainActivity : ComponentActivity() {
                         try {
                             if (mode == Mode.SWEEP && engine === e) {
                                 val t0 = System.currentTimeMillis()
-                                val info = e.process(frame)
+                                val info = e.offer(frame, t0)
                                 val ms = System.currentTimeMillis() - t0
                                 procCount++
-                                val diag = "#$procCount ${ms}ms ${info.how} m${info.matches}/i${info.inliers} k${info.keys}"
-                                if (debugSave) recordDebug(frame, diag, info)
-                                val pv = info.preview
-                                val pbmp = if (pv != null) {
-                                    val b = Bitmap.createBitmap(pv.cols(), pv.rows(), Bitmap.Config.ARGB_8888)
-                                    Utils.matToBitmap(pv, b); pv.release(); b
+                                val diag = "#$procCount ${ms}ms sharp %.0f/%.0f".format(info.sharp, info.maxSharp)
+                                if (debugSave) synchronized(debugFiles) { debugLog.append(diag + (if (info.newSnap != null) " SNAP ${info.count}" else "") + "\n") }
+                                val snap = info.newSnap
+                                val tb = if (snap != null) {
+                                    val b = Bitmap.createBitmap(snap.thumb.cols(), snap.thumb.rows(), Bitmap.Config.ARGB_8888)
+                                    Utils.matToBitmap(snap.thumb, b); b
                                 } else null
-                                onInfo(info, diag, pbmp)
+                                onInfo(info, diag, tb)
                             }
                         } catch (t: Throwable) {
                             setStatus("Tracking error: ${t.message}")
@@ -680,17 +676,6 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun recordDebug(frame: Mat, diag: String, info: MosaicEngine.Info) {
-        synchronized(debugFiles) {
-            debugLog.append("$diag sharp=%.0f acc=${info.accepted} key=${info.newKey}\n".format(info.sharp))
-            val now = System.currentTimeMillis()
-            if (debugFiles.size < 17 && now - lastDebugMs > 1500) {
-                lastDebugMs = now
-                debugFiles.add("%02d_frame_%03d.jpg".format(debugFiles.size, procCount) to encodeJpeg(frame, 90))
-            }
-        }
-    }
-
     /** Writes the recorded test frames + log as one zip in Download/WatchScan. */
     private fun writeDebugZip(result: Mat?) {
         val files: List<Pair<String, ByteArray>>
@@ -707,7 +692,7 @@ class MainActivity : ComponentActivity() {
                 z.putNextEntry(java.util.zip.ZipEntry(name)); z.write(data); z.closeEntry()
             }
             for ((n, d) in files) put(n, d)
-            if (result != null) put("99_result.jpg", encodeJpeg(result, 90))
+            if (result != null) put("00_all_photos.jpg", encodeJpeg(result, 90))
             put("log.txt", log.toByteArray())
         }
         val name = "watchscan_test_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date()) + ".zip"
@@ -725,21 +710,18 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun onInfo(info: MosaicEngine.Info, diag: String, preview: Bitmap?) {
+    private fun onInfo(info: SnapshotCollector.Info, diag: String, thumb: Bitmap?) {
         val hint = when {
-            info.how == "few features" -> "Not enough detail here \u2014 move closer to the text"
-            info.how == "waiting for a sharp view" -> "Hold steady to start\u2026"
-            !info.ok -> "Lost \u2014 move back over a part that's already in the preview"
-            info.keys == 1 && !info.newKey -> "Now sweep slowly across the page in an S"
-            !info.accepted -> "Too blurry \u2014 slow down"
-            else -> "Keep sweeping over the parts not in the preview yet"
+            info.sharp < 0.45 * info.maxSharp -> "Too blurry \u2014 slow down or hold steadier"
+            info.count == 0 -> "Hold steady for a moment, then sweep slowly in an S"
+            else -> "Keep sweeping until the whole page has been covered"
         }
-        if (info.newKey) vibrate(15)
+        if (thumb != null) vibrate(15)
         runOnUiThread {
             if (mode != Mode.SWEEP) return@runOnUiThread
-            statusText.text = "${info.keys} pieces \u00b7 tap Done when the page is complete\n$hint\n$diag"
-            if (preview != null) scanView.setMosaic(preview)
-            scanView.setFootprint(info.footprint, !info.ok)
+            statusText.text = "${info.count} photos \u00b7 tap Done when finished\n$hint\n$diag"
+            if (thumb != null) scanView.setMosaic(thumb)
+            scanView.setFootprint(null, info.sharp < 0.45 * info.maxSharp)
         }
     }
 }

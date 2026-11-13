@@ -14,14 +14,14 @@ object ClaudeClient {
         "claude-opus-5-5" to "Opus 5.5",
     )
 
-    private const val SYSTEM = """You are looking at a sheet of paper that the user scanned with a smartwatch camera. Read the question or questions on it and answer them.
+    private const val SYSTEM = """The user swept a smartwatch camera across a sheet of paper and took a series of overlapping close-up photos, roughly in an S pattern (across, down a bit, back across). Together the photos cover the page. Piece them together in your head, read the question or questions on the page, and answer them.
 
 Your reply is shown on a tiny round watch screen and may be read aloud, so:
 - Start with the answer itself (for multiple choice, give the letter and the option text).
 - Then add a short explanation only if it helps: at most three short sentences.
 - If there are several questions, number the answers to match.
 - Plain text only. No Markdown, no tables, no LaTeX.
-- If part of the page is unreadable or cut off, say which part, and answer what you can."""
+- If part of the page is missing or unreadable in every photo, say which part, and answer what you can."""
 
     private fun imageBlock(jpeg: ByteArray) = JSONObject()
         .put("type", "image")
@@ -32,19 +32,12 @@ Your reply is shown on a tiny round watch screen and may be read aloud, so:
                 .put("data", Base64.encodeToString(jpeg, Base64.NO_WRAP))
         )
 
-    /** [page] is the stitched full page; [closeUps] are sharp close-up photos of parts of it. */
-    fun ask(apiKey: String, model: String, page: ByteArray, closeUps: List<ByteArray> = emptyList()): String {
+    /** [photos] are overlapping close-ups of one page, in the order they were taken. */
+    fun ask(apiKey: String, model: String, photos: List<ByteArray>): String {
         val content = JSONArray()
-        content.put(JSONObject().put("type", "text").put("text", "Full page (stitched from many close-up frames):"))
-        content.put(imageBlock(page))
-        if (closeUps.isNotEmpty()) {
-            content.put(
-                JSONObject().put("type", "text").put(
-                    "text",
-                    "Close-up photos of parts of the same page (sharper, use them to read small or unclear text):"
-                )
-            )
-            for (c in closeUps) content.put(imageBlock(c))
+        photos.forEachIndexed { i, p ->
+            content.put(JSONObject().put("type", "text").put("text", "Photo ${i + 1} of ${photos.size}:"))
+            content.put(imageBlock(p))
         }
         content.put(JSONObject().put("type", "text").put("text", "Answer the question(s) on this page."))
         val body = JSONObject()
@@ -82,10 +75,10 @@ Your reply is shown on a tiny round watch screen and may be read aloud, so:
                 )
             }
             val json = JSONObject(resp)
-            val content = json.optJSONArray("content") ?: JSONArray()
+            val blocks = json.optJSONArray("content") ?: JSONArray()
             val sb = StringBuilder()
-            for (i in 0 until content.length()) {
-                val block = content.getJSONObject(i)
+            for (i in 0 until blocks.length()) {
+                val block = blocks.getJSONObject(i)
                 if (block.optString("type") == "text") sb.append(block.optString("text"))
             }
             val answer = sb.toString().trim()

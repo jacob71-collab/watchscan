@@ -1,0 +1,136 @@
+package com.jacob.watchscan
+
+import org.opencv.core.Core
+import org.opencv.core.Mat
+import org.opencv.core.Rect
+import org.opencv.core.Scalar
+import org.opencv.core.Size
+import org.opencv.imgproc.Imgproc
+import kotlin.math.max
+import kotlin.math.min
+
+/**
+ * Takes periodic snapshots while the user sweeps over a page.
+ *
+ * Within each time window it keeps the sharpest frame; at the end of the window that
+ * frame becomes a snapshot if it is reasonably sharp and not a near-duplicate of the
+ * previous snapshot (e.g. the user paused). Snapshots are lighting-corrected and
+ * stored as JPEGs sized for Claude.
+ *
+ * Call from one thread.
+ */
+class SnapshotCollector {
+    companion object {
+        const val WINDOW_MS = 900L
+        const val MAX_SEND = 20       // most photos sent in one request
+        const val MAX_KEEP = 40
+        const val SEND_LONG = 1600    // long edge of each photo sent to Claude
+    }
+
+    class Snap(val jpeg: ByteArray, val thumb: Mat, val sharp: Double)
+
+    class Info(val sharp: Double, val maxSharp: Double, val newSnap: Snap?, val count: Int)
+
+    val snaps = ArrayList<Snap>()
+    private var maxSharp = 0.0
+    private var windowStart = 0L
+    private var cand: Mat? = null
+    private var candSharp = 0.0
+    private var lastSig: Mat? = null
+
+    fun offer(frame: Mat, now: Long): Info {
+        val w = frame.cols(); val h = frame.rows()
+        val cr = Rect(max(0, w / 2 - 300), max(0, h / 2 - 300), min(600, w), min(600, h))
+        val sharp = laplaceVar(frame.submat(cr))
+        maxSharp = max(maxSharp * 0.985, sharp)
+        if (windowStart == 0L) windowStart = now
+
+        if (cand == null || sharp > candSharp) {
+            cand?.release()
+            cand = frame.clone()
+            candSharp = sharp
+        }
+        var made: Snap? = null
+        if (now - windowStart >= WINDOW_MS) {
+            val c = cand
+            if (c != null && candSharp >= 0.45 * maxSharp && snaps.size < MAX_KEEP) {
+                val sig = signature(c)
+                val prev = lastSig
+                if (prev == null || difference(sig, prev) > 7.0) {
+                    made = makeSnap(c, candSharp)
+                    snaps.add(made)
+                    prev?.release()
+                    lastSig = sig
+                } else {
+                    sig.release()
+                }
+            }
+            c?.release()
+            cand = null
+            candSharp = 0.0
+            windowStart = now
+        }
+        return Info(sharp, maxSharp, made, snaps.size)
+    }
+
+    /** Small blurred thumbnail used to spot near-duplicate snapshots. */
+    private fun signature(img: Mat): Mat {
+        val s = Mat()
+        Imgproc.resize(img, s, Size(64.0, 48.0), 0.0, 0.0, Imgproc.INTER_AREA)
+        Imgproc.GaussianBlur(s, s, Size(3.0, 3.0), 0.0)
+        Core.normalize(s, s, 0.0, 255.0, Core.NORM_MINMAX)
+        return s
+    }
+
+    private fun difference(a: Mat, b: Mat): Double {
+        val d = Mat()
+        Core.absdiff(a, b, d)
+        val m = Core.mean(d).`val`[0]
+        d.release()
+        return m
+    }
+
+    private fun makeSnap(frame: Mat, sharp: Double): Snap {
+        val flat = flatten(frame)
+        val (tw, th) = sizeForClaude(flat.cols(), flat.rows(), SEND_LONG, 4784)
+        val small = Mat()
+        Imgproc.resize(flat, small, Size(tw.toDouble(), th.toDouble()), 0.0, 0.0, Imgproc.INTER_AREA)
+        val jpeg = encodeJpeg(small, 84)
+        val thumb = Mat()
+        Imgproc.resize(flat, thumb, Size(240.0, 240.0 * flat.rows() / flat.cols()), 0.0, 0.0, Imgproc.INTER_AREA)
+        flat.release(); small.release()
+        return Snap(jpeg, thumb, sharp)
+    }
+
+    /** The photos to send, in sweep order: all of them, or MAX_SEND evenly spread. */
+    fun toSend(): List<ByteArray> {
+        if (snaps.size <= MAX_SEND) return snaps.map { it.jpeg }
+        return (0 until MAX_SEND).map { i -> snaps[(i * (snaps.size - 1).toDouble() / (MAX_SEND - 1)).toInt()].jpeg }
+    }
+
+    /** All snapshot thumbnails tiled into one image, numbered in order. */
+    fun contactSheet(): Mat {
+        val n = max(1, snaps.size)
+        val cols = min(4, n)
+        val rows = (n + cols - 1) / cols
+        val tw = 240
+        val th = snaps.firstOrNull()?.thumb?.rows() ?: 180
+        val sheet = Mat(rows * (th + 4) + 4, cols * (tw + 4) + 4, org.opencv.core.CvType.CV_8UC1, Scalar(40.0))
+        for ((i, s) in snaps.withIndex()) {
+            val x = 4 + (i % cols) * (tw + 4)
+            val y = 4 + (i / cols) * (th + 4)
+            val roi = sheet.submat(Rect(x, y, min(tw, s.thumb.cols()), min(th, s.thumb.rows())))
+            s.thumb.submat(Rect(0, 0, roi.cols(), roi.rows())).copyTo(roi)
+            Imgproc.putText(sheet, "${i + 1}", org.opencv.core.Point(x + 6.0, y + 26.0), Imgproc.FONT_HERSHEY_SIMPLEX, 0.8, Scalar(0.0), 4)
+            Imgproc.putText(sheet, "${i + 1}", org.opencv.core.Point(x + 6.0, y + 26.0), Imgproc.FONT_HERSHEY_SIMPLEX, 0.8, Scalar(255.0), 2)
+        }
+        return sheet
+    }
+
+    fun release() {
+        for (s in snaps) s.thumb.release()
+        snaps.clear()
+        cand?.release(); cand = null
+        lastSig?.release(); lastSig = null
+    }
+}
