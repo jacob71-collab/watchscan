@@ -726,7 +726,7 @@ class MainActivity : ComponentActivity() {
                                 val info = e.offer(frame, t0)
                                 val ms = System.currentTimeMillis() - t0
                                 procCount++
-                                val diag = "#$procCount ${ms}ms sharp %.0f/%.0f".format(info.sharp, info.maxSharp)
+                                val diag = "#$procCount ${ms}ms sharp %.0f/%.0f dark %d%%".format(info.sharp, info.maxSharp, (info.dark * 100).toInt())
                                 if (debugSave) synchronized(debugFiles) { debugLog.append(diag + (if (info.newSnap != null) " SNAP ${info.count}" else "") + "\n") }
                                 val snap = info.newSnap
                                 val st = stitcher
@@ -822,6 +822,7 @@ class MainActivity : ComponentActivity() {
 
     private fun onInfo(info: SnapshotCollector.Info, diag: String, thumb: Bitmap?) {
         val hint = when {
+            info.dark > 0.4 -> "Shadow or something is covering the page \u2014 keep your hand's shadow and the strap out of view"
             info.sharp < 0.45 * info.maxSharp -> "Too blurry \u2014 slow down or hold steadier"
             info.count == 0 -> "Start at a corner of the page, then sweep slowly in an S"
             else -> "Sweep in an S, a little past the paper's edges; tap Done when covered"

@@ -33,7 +33,8 @@ class SnapshotCollector {
      */
     class Snap(val full: Mat, val thumb: Mat, val sharp: Double, val px: Double, val py: Double, val unc: Double)
 
-    class Info(val sharp: Double, val maxSharp: Double, val newSnap: Snap?, val count: Int)
+    /** [dark] = share of the view that is in deep shadow or blocked (0..1). */
+    class Info(val sharp: Double, val maxSharp: Double, val newSnap: Snap?, val count: Int, val dark: Double)
 
     val snaps = ArrayList<Snap>()
     private var maxSharp = 0.0
@@ -52,11 +53,26 @@ class SnapshotCollector {
     private var candY = 0.0
     private var candUnc = 0.0
 
+    var lastDark = 0.0; private set
+    private var candDark = 0.0
+
+    /** Share of a small frame much darker than the paper (hand shadow, watch strap in view). */
+    private fun darkShare(small8: Mat): Double {
+        val n = small8.total().toInt()
+        val a = ByteArray(n); small8.get(0, 0, a)
+        val hist = IntArray(256); for (v in a) hist[v.toInt() and 0xff]++
+        var acc = 0; var p95 = 255
+        for (v in 0 until 256) { acc += hist[v]; if (acc >= n * 0.95) { p95 = v; break } }
+        var dark = 0; for (v in 0 until (p95 / 2)) dark += hist[v]
+        return dark.toDouble() / max(1, n)
+    }
+
     private fun track(frame: Mat) {
         val tw = 256
         val th = max(16, (256.0 * frame.rows() / frame.cols()).toInt())
         val small = Mat()
         Imgproc.resize(frame, small, Size(tw.toDouble(), th.toDouble()), 0.0, 0.0, Imgproc.INTER_AREA)
+        lastDark = darkShare(small)
         small.convertTo(small, org.opencv.core.CvType.CV_32F)
         if (win.empty() || win.cols() != tw || win.rows() != th) {
             Imgproc.createHanningWindow(win, Size(tw.toDouble(), th.toDouble()), org.opencv.core.CvType.CV_32F)
@@ -88,12 +104,13 @@ class SnapshotCollector {
             cand?.release()
             cand = frame.clone()
             candSharp = sharp
-            candX = posX; candY = posY; candUnc = unc
+            candX = posX; candY = posY; candUnc = unc; candDark = lastDark
         }
         var made: Snap? = null
         if (now - windowStart >= WINDOW_MS) {
             val c = cand
-            if (c != null && candSharp >= 0.45 * maxSharp && snaps.size < MAX_KEEP) {
+            // Skip views mostly covered by shadow or blocked: they add little and confuse the joining.
+            if (c != null && candSharp >= 0.45 * maxSharp && candDark < 0.55 && snaps.size < MAX_KEEP) {
                 val sig = signature(c)
                 val prev = lastSig
                 if (prev == null || difference(sig, prev) > 7.0) {
@@ -110,7 +127,7 @@ class SnapshotCollector {
             candSharp = 0.0
             windowStart = now
         }
-        return Info(sharp, maxSharp, made, snaps.size)
+        return Info(sharp, maxSharp, made, snaps.size, lastDark)
     }
 
     /** Small blurred thumbnail used to spot near-duplicate snapshots. */
