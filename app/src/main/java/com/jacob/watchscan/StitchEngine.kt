@@ -46,7 +46,12 @@ class StitchEngine {
     private class Img(
         val jpeg: ByteArray, val w: Int, val h: Int,
         val pts: Array<Point>, val des: Mat, val thumb: Mat,
+        val pos: Point?, val unc: Double,       // tracked camera position (stored-photo px)
+        val corners: List<Corner>,              // paper corners seen in this photo
     )
+
+    /** A paper corner at (x, y); (dx, dy) points into the paper. */
+    class Corner(val x: Double, val y: Double, val dx: Double, val dy: Double)
 
     private class Edge(val j: Int, val i: Int, val pj: Array<Point>, val pi: Array<Point>)
 
@@ -55,6 +60,9 @@ class StitchEngine {
     private val imgs = ArrayList<Img>()
     private val edges = ArrayList<Edge>()
     private var placedH = HashMap<Int, H>()   // photo -> sheet
+    private var byMotion = HashSet<Int>()      // placed from tracked motion only
+    var joined = 0; private set
+    var cornersFound = 0; private set
 
     val count get() = imgs.size
     val placed get() = placedH.size
@@ -62,7 +70,7 @@ class StitchEngine {
     // ------------------------------------------------------------------ adding photos
 
     /** Adds a snapshot (full-res grayscale). Returns the live preview of the sheet. */
-    fun add(frame: Mat): Mat? {
+    fun add(frame: Mat, px: Double = Double.NaN, py: Double = Double.NaN, unc: Double = 0.0): Mat? {
         val s = min(1.0, STORE_LONG.toDouble() / max(frame.cols(), frame.rows()))
         val full = Mat()
         if (s < 1.0) Imgproc.resize(frame, full, Size(frame.cols() * s, frame.rows() * s), 0.0, 0.0, Imgproc.INTER_AREA)
@@ -79,7 +87,8 @@ class StitchEngine {
         val thumb = Mat()
         Imgproc.resize(full, thumb, Size((w / 8).toDouble(), (h / 8).toDouble()), 0.0, 0.0, Imgproc.INTER_AREA)
         val i = imgs.size
-        imgs.add(Img(encodeJpeg(full, 92), w, h, pts, des, thumb))
+        val pos = if (px.isNaN()) null else Point(px * s, py * s)
+        imgs.add(Img(encodeJpeg(full, 92), w, h, pts, des, thumb, pos, unc * s, findCorners(thumb, w.toDouble() / thumb.cols())))
         full.release()
 
         // Candidates: the last few photos, plus any placed near where the previous one is.
@@ -114,13 +123,30 @@ class StitchEngine {
             val m = mm.toArray()
             if (m.size == 2 && m[0].distance < 0.8f * m[1].distance) { pa.add(a.pts[m[0].queryIdx]); pb.add(b.pts[m[0].trainIdx]) }
         }
+        // Use the tracked motion: keep only matches near where the camera movement says they should land.
+        var offX = 0.0; var offY = 0.0; var tol = -1.0
+        val ap = a.pos; val bp = b.pos
+        if (ap != null && bp != null) {
+            offX = ap.x - bp.x; offY = ap.y - bp.y
+            tol = min(0.15, 0.07 + 0.015 * (kotlin.math.abs(i - j) - 1)) * hypot(a.w.toDouble(), a.h.toDouble()) + kotlin.math.abs(a.unc - b.unc)
+            val fa = ArrayList<Point>(); val fb = ArrayList<Point>()
+            for (k in pa.indices) {
+                if (hypot(pb[k].x - (pa[k].x + offX), pb[k].y - (pa[k].y + offY)) < tol) { fa.add(pa[k]); fb.add(pb[k]) }
+            }
+            pa.clear(); pa.addAll(fa); pb.clear(); pb.addAll(fb)
+        }
         if (pa.size < 25) return null
         val mask = Mat()
         val hm = Calib3d.findHomography(MatOfPoint2f(*pa.toTypedArray()), MatOfPoint2f(*pb.toTypedArray()), Calib3d.RANSAC, 5.0, mask, 3000, 0.995)
         if (hm.empty()) return null
         val n = Core.countNonZero(mask)
         if (n < 25 || n < 0.2 * pa.size) return null
-        if (!plausible(H.fromMat(hm), a.w, a.h)) return null
+        val hl = H.fromMat(hm)
+        if (!plausible(hl, a.w, a.h)) return null
+        if (tol > 0) {
+            val cx = hl.mapX(a.w / 2.0, a.h / 2.0); val cy = hl.mapY(a.w / 2.0, a.h / 2.0)
+            if (hypot(cx - (a.w / 2.0 + offX), cy - (a.h / 2.0 + offY)) > tol) return null
+        }
         val m = ByteArray(pa.size); mask.get(0, 0, m)
         val ia = ArrayList<Point>(); val ib = ArrayList<Point>()
         for (k in pa.indices) if (m[k].toInt() != 0) { ia.add(pa[k]); ib.add(pb[k]) }
@@ -221,7 +247,21 @@ class StitchEngine {
         val hs = HashMap<Int, H>()
         for ((id, p) in pose) hs[id] = H(doubleArrayOf(p[0], -p[1], p[2], p[1], p[0], p[3], 0.0, 0.0, 1.0))
         refine(hs, live)
+        joined = hs.size
+        // Photos with nothing to match (e.g. blank paper) are placed from tracked motion next to a joined neighbour.
+        val motion = HashSet<Int>()
+        val joinedIds = hs.keys.toList()
+        for (i in imgs.indices) {
+            if (hs.containsKey(i)) continue
+            val pi = imgs[i].pos ?: continue
+            val j = joinedIds.filter { kotlin.math.abs(it - i) <= 3 && imgs[it].pos != null }.minByOrNull { kotlin.math.abs(it - i) } ?: continue
+            val pj = imgs[j].pos!!
+            hs[i] = hs[j]!! * H(doubleArrayOf(1.0, 0.0, pi.x - pj.x, 0.0, 1.0, pi.y - pj.y, 0.0, 0.0, 1.0))
+            motion.add(i)
+        }
         placedH = hs
+        byMotion = motion
+        cornersFound = cornerGroups().size
     }
 
     /** Full perspective fit of each photo to where its neighbours were placed. */
@@ -321,13 +361,112 @@ class StitchEngine {
         return 255.0
     }
 
+    // ------------------------------------------------------------------ paper corners
+
+    /** Paper corners visible in a photo thumbnail: crisp bright-paper vs darker-surroundings corners. */
+    private fun findCorners(thumb: Mat, up: Double): List<Corner> {
+        val w = thumb.cols(); val h = thumb.rows()
+        val b = Mat(); Imgproc.GaussianBlur(thumb, b, Size(5.0, 5.0), 0.0)
+        val m = Mat(); Imgproc.threshold(b, m, 0.0, 255.0, Imgproc.THRESH_BINARY + Imgproc.THRESH_OTSU)
+        try {
+            val fgN = Core.countNonZero(m)
+            if (fgN == 0 || (w * h - fgN) < 0.03 * w * h) return emptyList()
+            val inv = Mat(); Core.bitwise_not(m, inv)
+            val fg = Core.mean(b, m).`val`[0]; val bg = Core.mean(b, inv).`val`[0]
+            inv.release()
+            if (fg - bg < 25) return emptyList()
+            Imgproc.morphologyEx(m, m, Imgproc.MORPH_OPEN, Mat.ones(5, 5, CvType.CV_8U))
+            val cs = ArrayList<org.opencv.core.MatOfPoint>()
+            Imgproc.findContours(m, cs, Mat(), Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE)
+            val c = cs.maxByOrNull { Imgproc.contourArea(it) } ?: return emptyList()
+            if (Imgproc.contourArea(c) < 0.15 * w * h) return emptyList()
+            val c2 = MatOfPoint2f(*c.toArray())
+            val ap = MatOfPoint2f()
+            Imgproc.approxPolyDP(c2, ap, 0.02 * Imgproc.arcLength(c2, true), true)
+            val v = ap.toArray()
+            val out = ArrayList<Corner>()
+            val mx = 0.04 * w; val my = 0.04 * h
+            for (k in v.indices) {
+                val p = v[k]
+                if (p.x < mx || p.y < my || p.x > w - mx || p.y > h - my) continue // on the photo border
+                val pv = v[(k - 1 + v.size) % v.size]; val nx = v[(k + 1) % v.size]
+                val ax = pv.x - p.x; val ay = pv.y - p.y; val bx = nx.x - p.x; val by = nx.y - p.y
+                val la = hypot(ax, ay); val lb = hypot(bx, by)
+                if (min(la, lb) < 0.12 * min(w, h)) continue // both edges clearly visible
+                val cos = ((ax * bx + ay * by) / (la * lb)).coerceIn(-1.0, 1.0)
+                val ang = Math.toDegrees(kotlin.math.acos(cos))
+                if (ang < 65 || ang > 115) continue
+                val dx = ax / la + bx / lb; val dy = ay / la + by / lb
+                if (sharpEdges(b, p, ax / la, ay / la, la, dx, dy) && sharpEdges(b, p, bx / lb, by / lb, lb, dx, dy)) {
+                    out.add(Corner(p.x * up, p.y * up, dx, dy))
+                }
+            }
+            return out
+        } finally {
+            b.release(); m.release()
+        }
+    }
+
+    /** A real paper edge is a crisp brightness step, unlike soft lens vignetting. */
+    private fun sharpEdges(img: Mat, p: Point, ux: Double, uy: Double, len: Double, dx: Double, dy: Double): Boolean {
+        var nx = -uy; var ny = ux
+        if (nx * dx + ny * dy < 0) { nx = -nx; ny = -ny } // into the paper
+        val steps = ArrayList<Double>()
+        for (f in doubleArrayOf(0.15, 0.25, 0.35, 0.45, 0.55, 0.65, 0.75, 0.85)) {
+            val qx = p.x + ux * min(len, 60.0) * f; val qy = p.y + uy * min(len, 60.0) * f
+            val ix = (qx + nx * 3).toInt(); val iy = (qy + ny * 3).toInt()
+            val ox = (qx - nx * 3).toInt(); val oy = (qy - ny * 3).toInt()
+            if (ix < 0 || iy < 0 || ox < 0 || oy < 0 || ix >= img.cols() || ox >= img.cols() || iy >= img.rows() || oy >= img.rows()) continue
+            steps.add(img.get(iy, ix)[0] - img.get(oy, ox)[0])
+        }
+        if (steps.size < 4) return false
+        steps.sort()
+        return steps[steps.size / 2] >= 20.0
+    }
+
+    /** Detected corners on the sheet, grouped as 0 = top-left, 1 = top-right, 2 = bottom-right, 3 = bottom-left. */
+    private fun cornerGroups(): Map<Int, List<Point>> {
+        val found = HashMap<Int, MutableList<Point>>()
+        for ((id, h) in placedH) for (c in imgs[id].corners) {
+            val px = h.mapX(c.x, c.y); val py = h.mapY(c.x, c.y)
+            val qx = h.mapX(c.x + c.dx * 50, c.y + c.dy * 50) - px
+            val qy = h.mapY(c.x + c.dx * 50, c.y + c.dy * 50) - py
+            val kind = when {
+                qx > 0 && qy > 0 -> 0
+                qx <= 0 && qy > 0 -> 1
+                qx <= 0 -> 2
+                else -> 3
+            }
+            found.getOrPut(kind) { ArrayList() }.add(Point(px, py))
+        }
+        return found
+    }
+
+    /** Page outline from the paper's corners (TL, TR, BR, BL on the sheet) if at least 3 were seen. */
+    private fun pageFromCorners(): Array<Point>? {
+        val g = cornerGroups()
+        if (g.size < 3) return null
+        val q = arrayOfNulls<Point>(4)
+        for ((k, pts) in g) {
+            val xs = pts.map { it.x }.sorted(); val ys = pts.map { it.y }.sorted()
+            q[k] = Point(xs[xs.size / 2], ys[ys.size / 2])
+        }
+        for (miss in 0 until 4) if (q[miss] == null) {
+            val a = q[(miss + 1) % 4]!!; val c = q[(miss + 3) % 4]!!; val o = q[(miss + 2) % 4]!!
+            q[miss] = Point(a.x + c.x - o.x, a.y + c.y - o.y)
+        }
+        val xs = DoubleArray(4) { q[it]!!.x }; val ys = DoubleArray(4) { q[it]!!.y }
+        if (!isConvex(xs, ys) || polyArea(xs, ys) < 1000.0) return null
+        return Array(4) { q[it]!! }
+    }
+
     /** The finished sheet: joined, paper found and straightened, lighting evened out. */
     fun result(): Mat {
         if (placedH.isEmpty()) throw IllegalStateException("No photos could be joined.")
         val (mos, valid, t) = compose(OUT_LONG, full = true)
         val (raw, rvalid, tl) = compose(800, full = false)
-        var page: Array<Point>? = null
-        if (Core.countNonZero(rvalid) > 0) {
+        var page: Array<Point>? = pageFromCorners()?.map { Point(t.mapX(it.x, it.y), t.mapY(it.x, it.y)) }?.toTypedArray()
+        if (page == null && Core.countNonZero(rvalid) > 0) {
             // Fill gaps with a background-ish tone so they don't look like paper.
             val fill = percentileMasked(raw, rvalid, 0.05)
             val inv = Mat(); Core.bitwise_not(rvalid, inv); raw.setTo(Scalar(fill), inv); inv.release()
@@ -382,7 +521,7 @@ class StitchEngine {
     /** Stored photos, for the troubleshooting zip. */
     fun photoJpegs(): List<ByteArray> = imgs.map { it.jpeg }
 
-    fun describe(): String = "photos=${imgs.size} joined=${placedH.size} links=${edges.size}: " +
+    fun describe(): String = "photos=${imgs.size} joined=$joined byMotion=${byMotion.size} corners=$cornersFound links=${edges.size}: " +
         edges.joinToString(" ") { "${it.j}-${it.i}(${it.pi.size})" }
 
     fun release() {

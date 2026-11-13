@@ -100,6 +100,8 @@ class MainActivity : ComponentActivity() {
     @Volatile private var engine: SnapshotCollector? = null
     @Volatile private var stitcher: StitchEngine? = null
     @Volatile private var joined = 0
+    @Volatile private var corners = 0
+    private var lastZip: android.net.Uri? = null
     private val stitchExec = Executors.newSingleThreadExecutor()
     private var yBuf: ByteArray? = null
     private var qrDetector: QRCodeDetector? = null
@@ -276,6 +278,7 @@ class MainActivity : ComponentActivity() {
         settingsBox.addView(makeButton("Save test frames: " + if (debugSave) "on" else "off") {
             prefs.edit().putBoolean("debug", !debugSave).apply(); rebuildSettings()
         }, lp())
+        settingsBox.addView(makeButton("Share last test zip") { shareZip() }, lp())
         settingsBox.addView(makeButton("Save scans: " + if (saveScans) "on" else "off") {
             prefs.edit().putBoolean("save", !saveScans).apply(); rebuildSettings()
         }, lp())
@@ -309,6 +312,18 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun setStatus(s: String) = runOnUiThread { statusText.text = s }
+
+    private fun shareZip() {
+        val uri = lastZip
+        if (uri == null) { toast("No test zip yet. Turn on Save test frames, scan once, then try again."); return }
+        val send = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
+            type = "application/zip"
+            putExtra(android.content.Intent.EXTRA_STREAM, uri)
+            addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        try { startActivity(android.content.Intent.createChooser(send, "Share test zip")) }
+        catch (_: Throwable) { toast("No app on this watch can share files.") }
+    }
 
     private fun toast(s: String) = runOnUiThread {
         android.widget.Toast.makeText(this, s, android.widget.Toast.LENGTH_SHORT).show()
@@ -362,7 +377,7 @@ class MainActivity : ComponentActivity() {
                 Mode.READY -> {
                     scanView.setStill(null); scanView.clearOverlays()
                     mainButton.text = "Start"
-                    statusText.text = "Hold the watch close over the top-left of the page, tap Start, then sweep in an S"
+                    statusText.text = "Hold the watch close over the top-left corner of the page, tap Start, then sweep in an S past the edges"
                 }
                 Mode.SWEEP -> {
                     mainButton.text = "Done"
@@ -415,6 +430,7 @@ class MainActivity : ComponentActivity() {
         engine = SnapshotCollector()
         stitcher = StitchEngine()
         joined = 0
+        corners = 0
         runOnUiThread { scanView.clearOverlays() }
         enterMode(Mode.SWEEP)
     }
@@ -661,8 +677,9 @@ class MainActivity : ComponentActivity() {
                                     stitchExec.execute {
                                         try {
                                             if (stitcher === st) {
-                                                val pv = st.add(snap.full)
-                                                joined = st.placed
+                                                val pv = st.add(snap.full, snap.px, snap.py, snap.unc)
+                                                joined = st.joined
+                                                corners = st.cornersFound
                                                 if (pv != null) {
                                                     val b = Bitmap.createBitmap(pv.cols(), pv.rows(), Bitmap.Config.ARGB_8888)
                                                     Utils.matToBitmap(pv, b); pv.release()
@@ -743,6 +760,7 @@ class MainActivity : ComponentActivity() {
             }
             val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values) ?: return
             contentResolver.openOutputStream(uri)?.use { it.write(bos.toByteArray()) }
+            lastZip = uri
         } else {
             val dir = getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS) ?: return
             java.io.File(dir, name).writeBytes(bos.toByteArray())
@@ -752,13 +770,14 @@ class MainActivity : ComponentActivity() {
     private fun onInfo(info: SnapshotCollector.Info, diag: String, thumb: Bitmap?) {
         val hint = when {
             info.sharp < 0.45 * info.maxSharp -> "Too blurry \u2014 slow down or hold steadier"
-            info.count == 0 -> "Hold steady for a moment, then sweep slowly in an S"
-            else -> "Keep sweeping until the whole page has been covered"
+            info.count == 0 -> "Start at a corner of the page, then sweep slowly in an S"
+            corners < 4 -> "Sweep in an S, past the paper's edges, so all 4 corners are seen"
+            else -> "All corners seen \u2014 tap Done when the whole page is covered"
         }
         if (info.newSnap != null) vibrate(15)
         runOnUiThread {
             if (mode != Mode.SWEEP) return@runOnUiThread
-            statusText.text = "${info.count} photos \u00b7 $joined joined \u00b7 tap Done when finished\n$hint\n$diag"
+            statusText.text = "${info.count} photos \u00b7 $joined joined \u00b7 corners $corners/4\n$hint\n$diag"
             if (thumb != null) scanView.setMosaic(thumb)
             scanView.setFootprint(null, info.sharp < 0.45 * info.maxSharp)
         }

@@ -6,6 +6,7 @@ import org.opencv.core.Rect
 import org.opencv.core.Scalar
 import org.opencv.core.Size
 import org.opencv.imgproc.Imgproc
+import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.min
 
@@ -25,8 +26,12 @@ class SnapshotCollector {
         const val MAX_KEEP = 45
     }
 
-    /** [full] is handed to the stitcher, which releases it. */
-    class Snap(val full: Mat, val thumb: Mat, val sharp: Double)
+    /**
+     * [full] is handed to the stitcher, which releases it. [px], [py] is where the
+     * camera had moved to (tracked frame to frame, in full-frame pixels); [unc] grows
+     * when tracking was unsure.
+     */
+    class Snap(val full: Mat, val thumb: Mat, val sharp: Double, val px: Double, val py: Double, val unc: Double)
 
     class Info(val sharp: Double, val maxSharp: Double, val newSnap: Snap?, val count: Int)
 
@@ -37,17 +42,53 @@ class SnapshotCollector {
     private var candSharp = 0.0
     private var lastSig: Mat? = null
 
+    // Frame-to-frame motion tracking (phase correlation on small frames)
+    private var prevSmall: Mat? = null
+    private val win = Mat()
+    private var posX = 0.0
+    private var posY = 0.0
+    private var unc = 0.0
+    private var candX = 0.0
+    private var candY = 0.0
+    private var candUnc = 0.0
+
+    private fun track(frame: Mat) {
+        val tw = 256
+        val th = max(16, (256.0 * frame.rows() / frame.cols()).toInt())
+        val small = Mat()
+        Imgproc.resize(frame, small, Size(tw.toDouble(), th.toDouble()), 0.0, 0.0, Imgproc.INTER_AREA)
+        small.convertTo(small, org.opencv.core.CvType.CV_32F)
+        if (win.empty() || win.cols() != tw || win.rows() != th) {
+            Imgproc.createHanningWindow(win, Size(tw.toDouble(), th.toDouble()), org.opencv.core.CvType.CV_32F)
+        }
+        val prev = prevSmall
+        if (prev != null && prev.cols() == tw && prev.rows() == th) {
+            val resp = DoubleArray(1)
+            val sh = Imgproc.phaseCorrelate(prev, small, win, resp)
+            if (resp[0] > 0.02) {
+                posX -= sh.x * frame.cols() / tw
+                posY -= sh.y * frame.rows() / th
+            } else {
+                unc += 0.05 * hypot(frame.cols().toDouble(), frame.rows().toDouble())
+            }
+        }
+        prev?.release()
+        prevSmall = small
+    }
+
     fun offer(frame: Mat, now: Long): Info {
         val w = frame.cols(); val h = frame.rows()
         val cr = Rect(max(0, w / 2 - 300), max(0, h / 2 - 300), min(600, w), min(600, h))
         val sharp = laplaceVar(frame.submat(cr))
         maxSharp = max(maxSharp * 0.985, sharp)
         if (windowStart == 0L) windowStart = now
+        track(frame)
 
         if (cand == null || sharp > candSharp) {
             cand?.release()
             cand = frame.clone()
             candSharp = sharp
+            candX = posX; candY = posY; candUnc = unc
         }
         var made: Snap? = null
         if (now - windowStart >= WINDOW_MS) {
@@ -94,7 +135,7 @@ class SnapshotCollector {
         Imgproc.resize(frame, small, Size(240.0, 240.0 * frame.rows() / frame.cols()), 0.0, 0.0, Imgproc.INTER_AREA)
         val thumb = flatten(small)
         small.release()
-        return Snap(frame.clone(), thumb, sharp)
+        return Snap(frame.clone(), thumb, sharp, candX, candY, candUnc)
     }
 
     /** All snapshot thumbnails tiled into one image, numbered in order. */
@@ -121,5 +162,7 @@ class SnapshotCollector {
         snaps.clear()
         cand?.release(); cand = null
         lastSig?.release(); lastSig = null
+        prevSmall?.release(); prevSmall = null
+        win.release()
     }
 }
