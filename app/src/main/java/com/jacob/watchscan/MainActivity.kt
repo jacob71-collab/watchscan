@@ -149,6 +149,8 @@ class MainActivity : ComponentActivity() {
             return
         }
         qrDetector = QRCodeDetector()
+        Updater.cleanUp(this)
+        checkForUpdate(quiet = true)
         tts = TextToSpeech(this) { st -> ttsReady = st == TextToSpeech.SUCCESS }
 
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
@@ -263,6 +265,7 @@ class MainActivity : ComponentActivity() {
             gravity = Gravity.CENTER
             setPadding(0, 0, 0, dp(10f))
         })
+        settingsBox.addView(makeButton("Update app (now build ${Updater.currentBuild(this)})") { checkForUpdate(quiet = false) }, lp())
         settingsBox.addView(makeButton("Scan API key QR") { toggleSettings(); enterMode(Mode.KEY_QR) }, lp())
         settingsBox.addView(makeButton("Type API key") { typeKey() }, lp())
         val modelName = ClaudeClient.MODELS.firstOrNull { it.first == model }?.second ?: model
@@ -321,6 +324,43 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun setStatus(s: String) = runOnUiThread { statusText.text = s }
+
+    @Volatile private var updating = false
+
+    /** Checks GitHub for a newer build; if [quiet], only speaks up when there is one. */
+    private fun checkForUpdate(quiet: Boolean) {
+        if (updating) return
+        Thread {
+            try {
+                val r = Updater.latest()
+                val cur = Updater.currentBuild(this)
+                if (r.build <= cur) {
+                    if (!quiet) toast("You have the latest version (build $cur).")
+                    return@Thread
+                }
+                if (quiet) {
+                    toast("Update available: build ${r.build}. Open \u2699 \u2192 Update app.")
+                    return@Thread
+                }
+                if (!Updater.canInstall(this)) {
+                    toast("Allow WatchScan to install updates, then tap Update app again.")
+                    runOnUiThread { Updater.askInstallPermission(this) }
+                    return@Thread
+                }
+                updating = true
+                toast("Downloading build ${r.build}\u2026")
+                var lastShown = -1
+                val apk = Updater.download(this, r) { p ->
+                    if (p / 20 != lastShown) { lastShown = p / 20; toast("Downloading update: $p%") }
+                }
+                runOnUiThread { Updater.install(this, apk) }
+            } catch (t: Throwable) {
+                if (!quiet) toast("Couldn't update: ${t.message ?: t.javaClass.simpleName}. Check the internet connection.")
+            } finally {
+                updating = false
+            }
+        }.start()
+    }
 
     private fun shareZip() {
         val oldFile = prefs.getString("last_zip_file", null)?.let { java.io.File(it) }?.takeIf { it.exists() }

@@ -2,4 +2,5 @@
 <paths>
     <external-files-path name="app_files" path="." />
     <external-path name="shared_storage" path="." />
+    <cache-path name="updates" path="updates/" />
 </paths>
