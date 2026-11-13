@@ -457,8 +457,20 @@ class StitchEngine {
         val (big, bvalid, tb) = compose(800, full = false)
         try {
             findPaper(big, bvalid)?.let { q ->
-                val toP = t * tb.inv()
-                quad = q.map { Point(toP.mapX(it.x, it.y), toP.mapY(it.x, it.y)) }.toTypedArray()
+                // Trust the outline only where it follows real paper edges: just outside it
+                // should mostly be captured background, not the not-yet-scanned unknown.
+                val qm = Mat.zeros(big.rows(), big.cols(), CvType.CV_8UC1)
+                Imgproc.fillConvexPoly(qm, org.opencv.core.MatOfPoint(*q.map { Point(it.x, it.y) }.toTypedArray()), Scalar(255.0))
+                val ring = Mat(); Imgproc.dilate(qm, ring, Mat.ones(21, 21, CvType.CV_8U))
+                Core.subtract(ring, qm, ring)
+                val all = Core.countNonZero(ring)
+                Core.bitwise_and(ring, bvalid, ring)
+                val seen = Core.countNonZero(ring)
+                qm.release(); ring.release()
+                if (all > 0 && seen >= 0.6 * all) {
+                    val toP = t * tb.inv()
+                    quad = q.map { Point(toP.mapX(it.x, it.y), toP.mapY(it.x, it.y)) }.toTypedArray()
+                }
             }
         } catch (_: Throwable) {
         }

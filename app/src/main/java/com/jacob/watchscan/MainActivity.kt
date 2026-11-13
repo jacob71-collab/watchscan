@@ -740,7 +740,7 @@ class MainActivity : ComponentActivity() {
                                                 joined = st.joined
                                                 if (cov != null) {
                                                     coverageText = if (cov.pageFound) "page ${cov.goodPct}% good \u00b7 ${cov.missingPct}% missing"
-                                                        else "page edges not seen yet"
+                                                        else "edges not all seen yet"
                                                     pageFound = cov.pageFound; missingPct = cov.missingPct + cov.weakPct / 2
                                                     val b = Bitmap.createBitmap(cov.rgb.cols(), cov.rgb.rows(), Bitmap.Config.ARGB_8888)
                                                     Utils.matToBitmap(cov.rgb, b); cov.rgb.release()
