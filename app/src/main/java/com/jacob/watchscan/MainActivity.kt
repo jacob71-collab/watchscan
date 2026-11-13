@@ -98,6 +98,9 @@ class MainActivity : ComponentActivity() {
 
 
     @Volatile private var engine: SnapshotCollector? = null
+    @Volatile private var stitcher: StitchEngine? = null
+    @Volatile private var joined = 0
+    private val stitchExec = Executors.newSingleThreadExecutor()
     private var yBuf: ByteArray? = null
     private var qrDetector: QRCodeDetector? = null
     private var qrCounter = 0
@@ -157,6 +160,7 @@ class MainActivity : ComponentActivity() {
         tts?.shutdown()
         analyzerExec.shutdown()
         workExec.shutdown()
+        stitchExec.shutdown()
     }
 
     // ---------------------------------------------------------------- UI
@@ -392,7 +396,10 @@ class MainActivity : ComponentActivity() {
         tts?.stop()
         val e = engine
         engine = null
+        val st = stitcher
+        stitcher = null
         workExec.execute { e?.release() }
+        stitchExec.execute { st?.release() }
         lastAnswer = ""
         enterMode(Mode.READY)
     }
@@ -406,58 +413,74 @@ class MainActivity : ComponentActivity() {
         }
         vibrate(40)
         engine = SnapshotCollector()
+        stitcher = StitchEngine()
+        joined = 0
         runOnUiThread { scanView.clearOverlays() }
         enterMode(Mode.SWEEP)
     }
 
     private fun finishScan() {
         val e = engine ?: return
+        val st = stitcher ?: return
         if (mode != Mode.SWEEP) return
         enterMode(Mode.FINISHING)
-        setStatus("Preparing photos\u2026")
-        workExec.execute {
+        setStatus("Joining ${e.snaps.size} photos into one page\u2026")
+        // Runs after any photos still waiting to be joined.
+        stitchExec.execute {
             try {
-                if (e.snaps.isEmpty()) {
+                if (st.count == 0) {
                     showAnswer("No photos were taken. Hold the watch steady over the page for a moment, then sweep slowly. Tap New scan to try again.")
                     return@execute
                 }
-                val sheet = e.contactSheet()
-                val bmp = Bitmap.createBitmap(sheet.cols(), sheet.rows(), Bitmap.Config.ARGB_8888)
-                Utils.matToBitmap(sheet, bmp)
+                val result = st.result()
+                val ps = min(1.0, 900.0 / max(result.cols(), result.rows()))
+                val prev = Mat()
+                Imgproc.resize(result, prev, CvSize(result.cols() * ps, result.rows() * ps), 0.0, 0.0, Imgproc.INTER_AREA)
+                val bmp = Bitmap.createBitmap(prev.cols(), prev.rows(), Bitmap.Config.ARGB_8888)
+                Utils.matToBitmap(prev, bmp)
+                prev.release()
                 runOnUiThread { scanView.clearOverlays(); scanView.setStill(bmp) }
                 if (saveScans) {
-                    try { saveJpeg(encodeJpeg(sheet, 90)) } catch (t: Throwable) { /* not fatal */ }
+                    try { saveJpeg(encodeJpeg(result, 92)) } catch (t: Throwable) { /* not fatal */ }
                 }
                 if (debugSave) {
                     setStatus("Saving test photos\u2026")
                     synchronized(debugFiles) {
                         debugFiles.clear()
-                        e.snaps.forEachIndexed { i, sn -> debugFiles.add("%02d_photo.jpg".format(i + 1) to sn.jpeg) }
+                        st.photoJpegs().forEachIndexed { i, j -> debugFiles.add("%02d_photo.jpg".format(i + 1) to j) }
+                        debugLog.append(st.describe()).append("\n")
                     }
-                    try { writeDebugZip(sheet) } catch (t: Throwable) { /* not fatal */ }
+                    try { writeDebugZip(result) } catch (t: Throwable) { /* not fatal */ }
                 }
-                sheet.release()
+                val extras = if (st.placed < st.count) st.unplacedPhotos(6) else emptyList()
 
                 val key = apiKey
                 if (key.isEmpty()) {
+                    result.release()
                     showAnswer(
-                        "${e.snaps.size} photos taken" + (if (saveScans) " (overview saved to Pictures/WatchScan)." else ".") +
+                        "Scan finished (${st.placed} of ${st.count} photos joined)" +
+                            (if (saveScans) " and saved to Pictures/WatchScan." else ".") +
                             "\n\nTo get answers from Claude, add your API key in settings (\u2699)."
                     )
                     return@execute
                 }
-                val photos = e.toSend()
+                val (tw, th) = sizeForClaude(result.cols(), result.rows())
+                val small = Mat()
+                Imgproc.resize(result, small, CvSize(tw.toDouble(), th.toDouble()), 0.0, 0.0, Imgproc.INTER_AREA)
+                result.release()
+                val page = encodeJpeg(small, 88)
+                small.release()
                 val modelName = ClaudeClient.MODELS.firstOrNull { it.first == model }?.second ?: model
-                setStatus("Sending ${photos.size} photos to Claude ($modelName)\u2026")
+                setStatus("Asking Claude ($modelName)\u2026")
                 val answer = try {
-                    ClaudeClient.ask(key, model, photos)
+                    ClaudeClient.ask(key, model, page, extras)
                 } catch (t: Throwable) {
                     "Couldn't get an answer.\n\n${t.message ?: t.javaClass.simpleName}\n\nCheck the watch's internet connection, then tap New scan to try again."
                 }
                 vibrate(120)
                 showAnswer(answer)
             } catch (t: Throwable) {
-                showAnswer("Something went wrong: ${t.message}")
+                showAnswer("Something went wrong while joining the photos: ${t.message}")
             }
         }
     }
@@ -633,11 +656,27 @@ class MainActivity : ComponentActivity() {
                                 val diag = "#$procCount ${ms}ms sharp %.0f/%.0f".format(info.sharp, info.maxSharp)
                                 if (debugSave) synchronized(debugFiles) { debugLog.append(diag + (if (info.newSnap != null) " SNAP ${info.count}" else "") + "\n") }
                                 val snap = info.newSnap
-                                val tb = if (snap != null) {
-                                    val b = Bitmap.createBitmap(snap.thumb.cols(), snap.thumb.rows(), Bitmap.Config.ARGB_8888)
-                                    Utils.matToBitmap(snap.thumb, b); b
-                                } else null
-                                onInfo(info, diag, tb)
+                                val st = stitcher
+                                if (snap != null && st != null) {
+                                    stitchExec.execute {
+                                        try {
+                                            if (stitcher === st) {
+                                                val pv = st.add(snap.full)
+                                                joined = st.placed
+                                                if (pv != null) {
+                                                    val b = Bitmap.createBitmap(pv.cols(), pv.rows(), Bitmap.Config.ARGB_8888)
+                                                    Utils.matToBitmap(pv, b); pv.release()
+                                                    runOnUiThread { if (mode == Mode.SWEEP) scanView.setMosaic(b) }
+                                                }
+                                            }
+                                        } catch (t: Throwable) {
+                                            setStatus("Stitch error: ${t.message}")
+                                        } finally {
+                                            snap.full.release()
+                                        }
+                                    }
+                                }
+                                onInfo(info, diag, null)
                             }
                         } catch (t: Throwable) {
                             setStatus("Tracking error: ${t.message}")
@@ -692,7 +731,7 @@ class MainActivity : ComponentActivity() {
                 z.putNextEntry(java.util.zip.ZipEntry(name)); z.write(data); z.closeEntry()
             }
             for ((n, d) in files) put(n, d)
-            if (result != null) put("00_all_photos.jpg", encodeJpeg(result, 90))
+            if (result != null) put("00_result.jpg", encodeJpeg(result, 90))
             put("log.txt", log.toByteArray())
         }
         val name = "watchscan_test_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date()) + ".zip"
@@ -716,10 +755,10 @@ class MainActivity : ComponentActivity() {
             info.count == 0 -> "Hold steady for a moment, then sweep slowly in an S"
             else -> "Keep sweeping until the whole page has been covered"
         }
-        if (thumb != null) vibrate(15)
+        if (info.newSnap != null) vibrate(15)
         runOnUiThread {
             if (mode != Mode.SWEEP) return@runOnUiThread
-            statusText.text = "${info.count} photos \u00b7 tap Done when finished\n$hint\n$diag"
+            statusText.text = "${info.count} photos \u00b7 $joined joined \u00b7 tap Done when finished\n$hint\n$diag"
             if (thumb != null) scanView.setMosaic(thumb)
             scanView.setFootprint(null, info.sharp < 0.45 * info.maxSharp)
         }

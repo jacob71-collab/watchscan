@@ -1,18 +1,20 @@
 # WatchScan
 
-Android app for a camera smartwatch (built for the VP39, Android 11). It takes a series of sharp close-up photos as you sweep over a paper page, sends them to Claude, and shows the answer to the question on it.
+Android app for a camera smartwatch (built for the VP39, Android 11). It takes sharp close-up photos as you sweep over a paper page, joins them into one straightened scan on the watch, sends the scan to Claude, and shows the answer to the question on it.
 
 ## Using it
 
 1. **First launch:** point the camera at a QR code of your Claude API key (or tap **Skip** and add it later under ⚙ → *Type API key*).
 2. Hold the watch close over the top-left of the page and tap **Start**.
-3. Sweep slowly across the page in an S (across, down a bit, back across). About once a second the watch keeps the sharpest view as a photo and ticks; the latest photo shows on the right. A red outline means the view is too blurry: slow down.
-4. When you have covered the whole page, tap **Done**.
-5. Up to 20 photos are sent to Claude, which pieces the page together and answers the question. **Read aloud** speaks the answer. A sheet of all the photos is saved to *Pictures/WatchScan*.
-
-Cost: with Sonnet 5.5, 20 photos is roughly 50k input tokens, about $0.10 per question (about $0.20 with Opus 5.5).
+3. Sweep slowly across the page in an S (across, down a bit, back across), going a little past the paper's edges. About once a second the watch keeps the sharpest view as a photo and ticks. The preview on the right shows the photos being joined into one page; the status shows how many are joined. A red outline means the view is too blurry: slow down.
+4. When the preview shows the whole page, tap **Done**.
+5. The watch joins the photos into one sheet, finds the paper's edges, straightens it and evens the lighting. The sheet is saved to *Pictures/WatchScan* and sent to Claude (plus any photos that couldn't be joined). The answer appears on screen; **Read aloud** speaks it.
 
 Tips: good light helps most. Keep the text crisp on screen, and overlap each pass of the S with the previous one.
+
+## How the joining works
+
+Each photo is matched against recent and nearby photos. A link between two photos is kept only if many matching points agree, they're spread across the photo, and the geometry is plausible for two handheld shots of a flat page. All links are then solved together, so a single bad link can't throw a photo off; links that disagree with the joint solution are dropped. Photos that can't be joined are left out rather than pasted in the wrong place.
 
 ## Settings (⚙)
 

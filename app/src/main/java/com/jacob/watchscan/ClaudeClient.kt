@@ -14,14 +14,14 @@ object ClaudeClient {
         "claude-opus-5-5" to "Opus 5.5",
     )
 
-    private const val SYSTEM = """The user swept a smartwatch camera across a sheet of paper and took a series of overlapping close-up photos, roughly in an S pattern (across, down a bit, back across). Together the photos cover the page. Piece them together in your head, read the question or questions on the page, and answer them.
+    private const val SYSTEM = """The user scanned a sheet of paper with a smartwatch camera. The watch joined many close-up photos into the first image, a full-page scan. Any further images are close-ups the watch could not fit into the scan; use them to fill gaps. Read the question or questions on the page and answer them.
 
 Your reply is shown on a tiny round watch screen and may be read aloud, so:
 - Start with the answer itself (for multiple choice, give the letter and the option text).
 - Then add a short explanation only if it helps: at most three short sentences.
 - If there are several questions, number the answers to match.
 - Plain text only. No Markdown, no tables, no LaTeX.
-- If part of the page is missing or unreadable in every photo, say which part, and answer what you can."""
+- If part of the page is missing or unreadable, say which part, and answer what you can."""
 
     private fun imageBlock(jpeg: ByteArray) = JSONObject()
         .put("type", "image")
@@ -32,11 +32,13 @@ Your reply is shown on a tiny round watch screen and may be read aloud, so:
                 .put("data", Base64.encodeToString(jpeg, Base64.NO_WRAP))
         )
 
-    /** [photos] are overlapping close-ups of one page, in the order they were taken. */
-    fun ask(apiKey: String, model: String, photos: List<ByteArray>): String {
+    /** [page] is the stitched scan; [extras] are close-ups that could not be stitched in. */
+    fun ask(apiKey: String, model: String, page: ByteArray, extras: List<ByteArray>): String {
         val content = JSONArray()
-        photos.forEachIndexed { i, p ->
-            content.put(JSONObject().put("type", "text").put("text", "Photo ${i + 1} of ${photos.size}:"))
+        content.put(JSONObject().put("type", "text").put("text", "Full-page scan:"))
+        content.put(imageBlock(page))
+        extras.forEachIndexed { i, p ->
+            content.put(JSONObject().put("type", "text").put("text", "Extra close-up ${i + 1} (not in the scan):"))
             content.put(imageBlock(p))
         }
         content.put(JSONObject().put("type", "text").put("text", "Answer the question(s) on this page."))

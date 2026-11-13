@@ -97,13 +97,21 @@ fun pageSize(q: Array<Point>, long: Int): Pair<Int, Int> {
 }
 
 object PageDetector {
-    /** Returns page corners (TL, TR, BR, BL) in image coordinates, or null. */
-    fun detect(gray: Mat): Array<Point>? {
+    /**
+     * Returns page corners (TL, TR, BR, BL) in image coordinates, or null.
+     * Candidates are 4-sided outlines from a brightness threshold and from edges; the
+     * winner is the large one that is clearly brighter inside than just outside it.
+     * [valid] (optional, 255 = captured) excludes outlines whose outside was never seen.
+     */
+    fun detect(gray: Mat, valid: Mat? = null): Array<Point>? {
         val w = gray.cols(); val h = gray.rows()
         val s = 640.0 / max(w, h)
+        val sz = Size((w * s).toInt().toDouble(), (h * s).toInt().toDouble())
         val small = Mat()
-        Imgproc.resize(gray, small, Size((w * s).toInt().toDouble(), (h * s).toInt().toDouble()), 0.0, 0.0, Imgproc.INTER_AREA)
+        Imgproc.resize(gray, small, sz, 0.0, 0.0, Imgproc.INTER_AREA)
         Imgproc.GaussianBlur(small, small, Size(5.0, 5.0), 0.0)
+        var vs: Mat? = null
+        if (valid != null) { vs = Mat(); Imgproc.resize(valid, vs, sz, 0.0, 0.0, Imgproc.INTER_NEAREST) }
         val areaMin = 0.15 * small.rows() * small.cols()
         val th = Mat()
         Imgproc.threshold(small, th, 0.0, 255.0, Imgproc.THRESH_BINARY + Imgproc.THRESH_OTSU)
@@ -111,8 +119,7 @@ object PageDetector {
         val ed = Mat()
         Imgproc.Canny(small, ed, 30.0, 90.0)
         Imgproc.dilate(ed, ed, Mat.ones(3, 3, CvType.CV_8U))
-        var best: Array<Point>? = null
-        var bestArea = 0.0
+        val cands = ArrayList<Pair<Double, Array<Point>>>()
         for (m in listOf(th, ed)) {
             val contours = ArrayList<MatOfPoint>()
             Imgproc.findContours(m, contours, Mat(), Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE)
@@ -129,16 +136,34 @@ object PageDetector {
                     val a = ap.toArray()
                     if (a.size == 4) {
                         val xs = DoubleArray(4) { a[it].x }; val ys = DoubleArray(4) { a[it].y }
-                        if (isConvex(xs, ys)) {
-                            val area = polyArea(xs, ys)
-                            if (area > bestArea) { bestArea = area; best = a }
-                        }
+                        if (isConvex(xs, ys)) cands.add(Pair(polyArea(xs, ys), a))
                         break
                     }
                 }
             }
         }
-        small.release(); th.release(); ed.release()
+        var best: Array<Point>? = null
+        var bestScore = 0.0
+        val inside = Mat(); val dil = Mat(); val inv = Mat(); val ring = Mat()
+        val kernel = Mat.ones(25, 25, CvType.CV_8U)
+        for ((area, q) in cands) {
+            inside.create(small.size(), CvType.CV_8UC1); inside.setTo(org.opencv.core.Scalar(0.0))
+            Imgproc.fillConvexPoly(inside, MatOfPoint(*q.map { Point(it.x, it.y) }.toTypedArray()), org.opencv.core.Scalar(255.0))
+            Imgproc.dilate(inside, dil, kernel)
+            Core.bitwise_not(inside, inv)
+            Core.bitwise_and(dil, inv, ring)
+            if (vs != null) {
+                val all = Core.countNonZero(ring)
+                Core.bitwise_and(ring, vs, ring)
+                if (all > 0 && Core.countNonZero(ring) < 0.3 * all) continue
+            }
+            val contrast = if (Core.countNonZero(ring) == 0) 20.0
+            else Core.mean(small, inside).`val`[0] - Core.mean(small, ring).`val`[0]
+            val score = area * max(0.0, contrast)
+            if (score > bestScore) { bestScore = score; best = q }
+        }
+        small.release(); th.release(); ed.release(); vs?.release()
+        inside.release(); dil.release(); inv.release(); ring.release()
         val b = best ?: return null
         return order(b.map { Point(it.x / s, it.y / s) }.toTypedArray())
     }

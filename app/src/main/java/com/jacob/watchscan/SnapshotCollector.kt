@@ -21,13 +21,12 @@ import kotlin.math.min
  */
 class SnapshotCollector {
     companion object {
-        const val WINDOW_MS = 900L
-        const val MAX_SEND = 20       // most photos sent in one request
-        const val MAX_KEEP = 40
-        const val SEND_LONG = 1600    // long edge of each photo sent to Claude
+        const val WINDOW_MS = 800L
+        const val MAX_KEEP = 45
     }
 
-    class Snap(val jpeg: ByteArray, val thumb: Mat, val sharp: Double)
+    /** [full] is handed to the stitcher, which releases it. */
+    class Snap(val full: Mat, val thumb: Mat, val sharp: Double)
 
     class Info(val sharp: Double, val maxSharp: Double, val newSnap: Snap?, val count: Int)
 
@@ -91,21 +90,11 @@ class SnapshotCollector {
     }
 
     private fun makeSnap(frame: Mat, sharp: Double): Snap {
-        val flat = flatten(frame)
-        val (tw, th) = sizeForClaude(flat.cols(), flat.rows(), SEND_LONG, 4784)
         val small = Mat()
-        Imgproc.resize(flat, small, Size(tw.toDouble(), th.toDouble()), 0.0, 0.0, Imgproc.INTER_AREA)
-        val jpeg = encodeJpeg(small, 84)
-        val thumb = Mat()
-        Imgproc.resize(flat, thumb, Size(240.0, 240.0 * flat.rows() / flat.cols()), 0.0, 0.0, Imgproc.INTER_AREA)
-        flat.release(); small.release()
-        return Snap(jpeg, thumb, sharp)
-    }
-
-    /** The photos to send, in sweep order: all of them, or MAX_SEND evenly spread. */
-    fun toSend(): List<ByteArray> {
-        if (snaps.size <= MAX_SEND) return snaps.map { it.jpeg }
-        return (0 until MAX_SEND).map { i -> snaps[(i * (snaps.size - 1).toDouble() / (MAX_SEND - 1)).toInt()].jpeg }
+        Imgproc.resize(frame, small, Size(240.0, 240.0 * frame.rows() / frame.cols()), 0.0, 0.0, Imgproc.INTER_AREA)
+        val thumb = flatten(small)
+        small.release()
+        return Snap(frame.clone(), thumb, sharp)
     }
 
     /** All snapshot thumbnails tiled into one image, numbered in order. */
