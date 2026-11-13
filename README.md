@@ -5,20 +5,20 @@ Android app for a camera smartwatch (built for the VP39, Android 11). It builds 
 ## Using it
 
 1. **First launch:** point the camera at a QR code of your Claude API key (or tap **Skip** and add it later under ⚙ → *Type API key*).
-2. **Step 1:** hold the watch back so the whole page fits. A green outline means the page was found. Tap **Capture page**.
-3. **Step 2:** move closer (about 15–20 cm) and sweep slowly over the page. The mini-map on the right fills in:
-   - green = captured sharply, dark green = blank paper (nothing to capture)
-   - yellow = captured but too far away, grey = not yet captured
-4. When the whole map is green it finishes on its own, or tap **Done** at any time.
-5. The scan is saved to *Pictures/WatchScan* and sent to Claude. The answer appears on screen; **Read aloud** speaks it.
+2. Hold the watch close over one corner of the page and tap **Start**.
+3. Sweep slowly across the page in an S pattern. The preview on the right shows the page building up; the watch ticks each time a new piece is added. A red outline means it lost its place: move back over a part that is already in the preview.
+4. When the whole page is in the preview, tap **Done**.
+5. The paper is found and straightened, saved to *Pictures/WatchScan*, and sent to Claude (with a few of the sharpest close-ups). The answer appears on screen; **Read aloud** speaks it.
 
-Tips: good light helps most. If it says *Lost the page*, back off a little so more text is in view.
+Tips: good light helps most. Keep roughly the same distance the whole time, and overlap each pass of the S with the previous one.
 
 ## Settings (⚙)
 
 - **Model:** Sonnet 5.5 (fast, default) or Opus 5.5 (stronger on hard questions).
 - **Camera:** back/front, for watches with a rotating camera.
 - **Detail:** normal (1920×1440 frames) or high (2560×1920, slower).
+- **Flashlight:** keeps the camera light on while scanning, if there is one.
+- **Save test frames:** saves a zip of frames + a log to *Download/WatchScan* for troubleshooting.
 - **Save scans:** keep a copy of each scan in the gallery.
 
 ## Building

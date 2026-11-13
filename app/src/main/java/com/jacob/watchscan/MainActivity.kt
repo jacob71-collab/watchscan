@@ -69,9 +69,9 @@ import kotlin.math.min
 
 class MainActivity : ComponentActivity() {
 
-    enum class Mode { KEY_QR, OVERVIEW, STARTING, SWEEP, FINISHING, ANSWER }
+    enum class Mode { KEY_QR, READY, SWEEP, FINISHING, ANSWER }
 
-    @Volatile private var mode = Mode.OVERVIEW
+    @Volatile private var mode = Mode.READY
 
     private lateinit var prefs: android.content.SharedPreferences
     private lateinit var scanView: ScanView
@@ -96,11 +96,8 @@ class MainActivity : ComponentActivity() {
     @Volatile private var camDesc = ""
     @Volatile private var lastFocusMs = 0L
 
-    private val lock = Any()
-    private var lastFrame: Mat? = null
-    private var lastQuad: Array<Point>? = null
 
-    @Volatile private var engine: ScanEngine? = null
+    @Volatile private var engine: MosaicEngine? = null
     private var yBuf: ByteArray? = null
     private var qrDetector: QRCodeDetector? = null
     private var qrCounter = 0
@@ -149,7 +146,7 @@ class MainActivity : ComponentActivity() {
             override fun handleOnBackPressed() = onBack()
         })
 
-        if (apiKey.isEmpty()) enterMode(Mode.KEY_QR) else enterMode(Mode.OVERVIEW)
+        if (apiKey.isEmpty()) enterMode(Mode.KEY_QR) else enterMode(Mode.READY)
 
         if (checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) startCamera()
         else askPermission.launch(Manifest.permission.CAMERA)
@@ -347,26 +344,25 @@ class MainActivity : ComponentActivity() {
     private fun enterMode(m: Mode) {
         mode = m
         runOnUiThread {
-            progress.visibility = if (m == Mode.STARTING || m == Mode.FINISHING) View.VISIBLE else View.GONE
+            progress.visibility = if (m == Mode.FINISHING) View.VISIBLE else View.GONE
             answerPanel.visibility = if (m == Mode.ANSWER) View.VISIBLE else View.GONE
             bottomBar.visibility = if (m == Mode.ANSWER) View.GONE else View.VISIBLE
             statusText.visibility = if (m == Mode.ANSWER) View.GONE else View.VISIBLE
-            mainButton.isEnabled = m == Mode.OVERVIEW || m == Mode.SWEEP || m == Mode.KEY_QR
+            mainButton.isEnabled = m == Mode.READY || m == Mode.SWEEP || m == Mode.KEY_QR
             when (m) {
                 Mode.KEY_QR -> {
                     scanView.setStill(null); scanView.clearOverlays()
                     mainButton.text = "Skip"
                     statusText.text = "Point the camera at your API-key QR code"
                 }
-                Mode.OVERVIEW -> {
+                Mode.READY -> {
                     scanView.setStill(null); scanView.clearOverlays()
-                    mainButton.text = "Capture page"
-                    statusText.text = "Step 1: fit the whole page in view, then tap Capture"
+                    mainButton.text = "Start"
+                    statusText.text = "Hold the watch close over one corner of the page, then tap Start"
                 }
-                Mode.STARTING -> statusText.text = "Reading the page…"
                 Mode.SWEEP -> {
                     mainButton.text = "Done"
-                    statusText.text = "Step 2: move closer and sweep slowly over the page"
+                    statusText.text = "Hold steady\u2026"
                 }
                 Mode.FINISHING -> mainButton.text = "…"
                 Mode.ANSWER -> {}
@@ -376,8 +372,8 @@ class MainActivity : ComponentActivity() {
 
     private fun onMain() {
         when (mode) {
-            Mode.KEY_QR -> enterMode(Mode.OVERVIEW)
-            Mode.OVERVIEW -> capturePage()
+            Mode.KEY_QR -> enterMode(Mode.READY)
+            Mode.READY -> startScan()
             Mode.SWEEP -> finishScan()
             else -> {}
         }
@@ -398,55 +394,20 @@ class MainActivity : ComponentActivity() {
         engine = null
         workExec.execute { e?.release() }
         lastAnswer = ""
-        enterMode(Mode.OVERVIEW)
+        enterMode(Mode.READY)
     }
 
-    private fun capturePage() {
-        val grabbed: Pair<Mat, Array<Point>>? = synchronized(lock) {
-            val f = lastFrame
-            if (f == null) {
-                null
-            } else {
-                val w = f.cols().toDouble()
-                val h = f.rows().toDouble()
-                Pair(
-                    f.clone(),
-                    lastQuad ?: arrayOf(
-                        Point(w * 0.03, h * 0.03), Point(w * 0.97, h * 0.03),
-                        Point(w * 0.97, h * 0.97), Point(w * 0.03, h * 0.97)
-                    )
-                )
+    private fun startScan() {
+        synchronized(debugFiles) {
+            debugFiles.clear(); debugLog.setLength(0); procCount = 0; lastDebugMs = 0L
+            if (debugSave) {
+                debugLog.append("camera: $camDesc\nmodel: ${Build.MANUFACTURER} ${Build.MODEL}, Android ${Build.VERSION.RELEASE}\n")
             }
         }
-        if (grabbed == null) return
-        val (frame, quad) = grabbed
         vibrate(40)
-        enterMode(Mode.STARTING)
-        workExec.execute {
-            try {
-                val e = ScanEngine()
-                synchronized(debugFiles) {
-                    debugFiles.clear(); debugLog.setLength(0); procCount = 0; lastDebugMs = 0L
-                    if (debugSave) {
-                        debugFiles.add("00_overview.jpg" to encodeJpeg(frame, 92))
-                        debugLog.append("camera: $camDesc\nmodel: ${Build.MANUFACTURER} ${Build.MODEL}, Android ${Build.VERSION.RELEASE}\n")
-                        debugLog.append("quad: " + quad.joinToString(" ") { "%.0f,%.0f".format(it.x, it.y) } + "\n")
-                    }
-                }
-                e.start(frame, quad)
-                engine = e
-                runOnUiThread {
-                    scanView.setOutline(null, Color.CYAN)
-                    scanView.setGrid(IntArray(e.cols * e.rows), e.cols, e.rows, e.rh.toFloat() / e.rw, null)
-                }
-                enterMode(Mode.SWEEP)
-            } catch (t: Throwable) {
-                setStatus("Could not start: ${t.message}")
-                enterMode(Mode.OVERVIEW)
-            } finally {
-                frame.release()
-            }
-        }
+        engine = MosaicEngine()
+        runOnUiThread { scanView.clearOverlays() }
+        enterMode(Mode.SWEEP)
     }
 
     private fun finishScan() {
@@ -483,7 +444,7 @@ class MainActivity : ComponentActivity() {
                     )
                     return@execute
                 }
-                val closeUps = e.shots.sortedBy { it.cy * 10 + it.cx }.map { it.jpeg }
+                val closeUps = try { e.closeUps(4) } catch (_: Throwable) { emptyList() }
                 val (tw, th) = sizeForClaude(result.cols(), result.rows())
                 val small = Mat()
                 Imgproc.resize(result, small, CvSize(tw.toDouble(), th.toDouble()), 0.0, 0.0, Imgproc.INTER_AREA)
@@ -645,10 +606,10 @@ class MainActivity : ComponentActivity() {
         frameCount++
         if (frameCount == 1) {
             camDesc = "${up.cols()}x${up.rows()}, " + camDesc
-            if (mode == Mode.OVERVIEW) setStatus("Camera $camDesc\nFit the whole page in view, then tap Capture")
+            if (mode == Mode.READY) setStatus("Camera $camDesc\nHold the watch close over one corner of the page, then tap Start")
         }
         // Cameras without continuous autofocus need a nudge every few seconds.
-        if (!continuousAf && (mode == Mode.SWEEP || mode == Mode.OVERVIEW) &&
+        if (!continuousAf && (mode == Mode.SWEEP || mode == Mode.READY) &&
             System.currentTimeMillis() - lastFocusMs > 2500) focusCentre()
 
         // Viewfinder
@@ -662,19 +623,6 @@ class MainActivity : ComponentActivity() {
         scanView.post { scanView.setFrame(bmp) }
 
         when (mode) {
-            Mode.OVERVIEW -> {
-                val q = PageDetector.detect(up)
-                synchronized(lock) {
-                    lastFrame?.release()
-                    lastFrame = up
-                    lastQuad = q
-                }
-                val norm = q?.let { qq ->
-                    FloatArray(8) { i -> if (i % 2 == 0) (qq[i / 2].x / up.cols()).toFloat() else (qq[i / 2].y / up.rows()).toFloat() }
-                }
-                scanView.post { if (mode == Mode.OVERVIEW) scanView.setOutline(norm, Color.GREEN) }
-                return // `up` is kept as lastFrame
-            }
             Mode.SWEEP -> {
                 val e = engine
                 if (e != null && !busy.getAndSet(true)) {
@@ -686,9 +634,14 @@ class MainActivity : ComponentActivity() {
                                 val info = e.process(frame)
                                 val ms = System.currentTimeMillis() - t0
                                 procCount++
-                                val diag = "#$procCount ${ms}ms ${e.lastHow} m${e.lastMatches}/i${e.lastInliers} f%.2f".format(info.f)
-                                if (debugSave) recordDebug(frame, diag, info, e.lastSharp)
-                                onInfo(info, diag)
+                                val diag = "#$procCount ${ms}ms ${info.how} m${info.matches}/i${info.inliers} k${info.keys}"
+                                if (debugSave) recordDebug(frame, diag, info)
+                                val pv = info.preview
+                                val pbmp = if (pv != null) {
+                                    val b = Bitmap.createBitmap(pv.cols(), pv.rows(), Bitmap.Config.ARGB_8888)
+                                    Utils.matToBitmap(pv, b); pv.release(); b
+                                } else null
+                                onInfo(info, diag, pbmp)
                             }
                         } catch (t: Throwable) {
                             setStatus("Tracking error: ${t.message}")
@@ -720,16 +673,16 @@ class MainActivity : ComponentActivity() {
         if (key.startsWith("sk-ant-")) {
             prefs.edit().putString("api_key", key).apply()
             vibrate(150)
-            enterMode(Mode.OVERVIEW)
+            enterMode(Mode.READY)
             setStatus("API key saved ✓  Now fit a page in view and tap Capture")
         } else {
             setStatus("That QR code isn't a Claude API key (should start with sk-ant-)")
         }
     }
 
-    private fun recordDebug(frame: Mat, diag: String, info: ScanEngine.Info, sharp: Double) {
+    private fun recordDebug(frame: Mat, diag: String, info: MosaicEngine.Info) {
         synchronized(debugFiles) {
-            debugLog.append("$diag sharp=%.0f acc=${info.accepted} upd=${info.updated} good=${info.good}/${info.total}\n".format(sharp))
+            debugLog.append("$diag sharp=%.0f acc=${info.accepted} key=${info.newKey}\n".format(info.sharp))
             val now = System.currentTimeMillis()
             if (debugFiles.size < 17 && now - lastDebugMs > 1500) {
                 lastDebugMs = now
@@ -772,25 +725,21 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun onInfo(info: ScanEngine.Info, diag: String) {
-        val pct = 100 * info.good / max(1, info.total)
+    private fun onInfo(info: MosaicEngine.Info, diag: String, preview: Bitmap?) {
         val hint = when {
-            !info.ok -> "Lost the page — move back a little so more text is visible"
-            info.f > ScanEngine.GOOD_F && hasAf -> "Move closer to the paper"
-            info.f > ScanEngine.GOOD_F -> "Move a bit closer, but stop before the view gets blurry"
-            !info.accepted -> "Hold steady…"
-            else -> "Sweep over the yellow/grey areas"
+            info.how == "few features" -> "Not enough detail here \u2014 move closer to the text"
+            info.how == "waiting for a sharp view" -> "Hold steady to start\u2026"
+            !info.ok -> "Lost \u2014 move back over a part that's already in the preview"
+            info.keys == 1 && !info.newKey -> "Now sweep slowly across the page in an S"
+            !info.accepted -> "Too blurry \u2014 slow down"
+            else -> "Keep sweeping over the parts not in the preview yet"
         }
-        val e = engine ?: return
+        if (info.newKey) vibrate(15)
         runOnUiThread {
             if (mode != Mode.SWEEP) return@runOnUiThread
-            statusText.text = "$pct% captured\n$hint\n$diag"
-            scanView.setOutline(info.pageInFrame, Color.CYAN)
-            scanView.setGrid(info.status, info.cols, info.rows, e.rh.toFloat() / e.rw, info.footprint)
-            if (info.done) {
-                vibrate(200)
-                finishScan()
-            }
+            statusText.text = "${info.keys} pieces \u00b7 tap Done when the page is complete\n$hint\n$diag"
+            if (preview != null) scanView.setMosaic(preview)
+            scanView.setFootprint(info.footprint, !info.ok)
         }
     }
 }

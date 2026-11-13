@@ -10,123 +10,64 @@ import android.graphics.RectF
 import android.view.View
 import kotlin.math.min
 
-/** Viewfinder with page outline, plus a mini-map of which parts of the page are captured. */
+/** Viewfinder, plus a live preview of the page being built up while sweeping. */
 class ScanView(context: Context) : View(context) {
     private var frame: Bitmap? = null
     private var still: Bitmap? = null
-
-    /** Page outline in the frame, normalised (8 floats), and whether it is a confident detection. */
-    private var outline: FloatArray? = null
-    private var outlineColor = Color.GREEN
-
-    private var grid: IntArray? = null
-    private var cols = 0
-    private var rows = 0
-    private var pageAspect = 1.29f // height / width
+    private var mosaic: Bitmap? = null
     private var footprint: FloatArray? = null
+    private var lostFlag = false
 
     private val bmpPaint = Paint(Paint.FILTER_BITMAP_FLAG)
     private val line = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE; strokeWidth = 4f }
     private val fill = Paint()
-    private val frameRect = RectF()
+    private val r = RectF()
 
-    fun setFrame(bmp: Bitmap) {
-        frame = bmp
-        invalidate()
-    }
+    fun setFrame(bmp: Bitmap) { frame = bmp; invalidate() }
+    fun setStill(bmp: Bitmap?) { still = bmp; invalidate() }
 
-    fun setStill(bmp: Bitmap?) {
-        still = bmp
-        invalidate()
-    }
+    fun setMosaic(bmp: Bitmap?) { if (bmp != null) mosaic = bmp; invalidate() }
 
-    fun setOutline(o: FloatArray?, color: Int) {
-        outline = o
-        outlineColor = color
-        invalidate()
-    }
+    fun setFootprint(f: FloatArray?, lost: Boolean) { footprint = f; lostFlag = lost; invalidate() }
 
-    fun setGrid(status: IntArray?, cols: Int, rows: Int, aspect: Float, foot: FloatArray?) {
-        grid = status
-        this.cols = cols
-        this.rows = rows
-        pageAspect = aspect
-        footprint = foot
-        invalidate()
-    }
+    fun clearOverlays() { mosaic = null; footprint = null; lostFlag = false; invalidate() }
 
-    fun clearOverlays() {
-        outline = null
-        grid = null
-        footprint = null
-        invalidate()
-    }
-
-    private fun fitRect(bw: Int, bh: Int, out: RectF) {
-        val s = min(width.toFloat() / bw, height.toFloat() / bh)
-        val dw = bw * s
-        val dh = bh * s
-        out.set((width - dw) / 2, (height - dh) / 2, (width + dw) / 2, (height + dh) / 2)
+    private fun fit(bw: Int, bh: Int, maxW: Float, maxH: Float, cx: Float, cy: Float, out: RectF) {
+        val s = min(maxW / bw, maxH / bh)
+        out.set(cx - bw * s / 2, cy - bh * s / 2, cx + bw * s / 2, cy + bh * s / 2)
     }
 
     override fun onDraw(canvas: Canvas) {
         canvas.drawColor(Color.BLACK)
         val st = still
         if (st != null) {
-            fitRect(st.width, st.height, frameRect)
-            canvas.drawBitmap(st, null, frameRect, bmpPaint)
+            fit(st.width, st.height, width.toFloat(), height.toFloat(), width / 2f, height / 2f, r)
+            canvas.drawBitmap(st, null, r, bmpPaint)
             return
         }
         val fr = frame ?: return
-        fitRect(fr.width, fr.height, frameRect)
-        canvas.drawBitmap(fr, null, frameRect, bmpPaint)
-
-        outline?.let { o ->
-            val p = Path()
-            for (k in 0 until 4) {
-                val x = frameRect.left + o[2 * k] * frameRect.width()
-                val y = frameRect.top + o[2 * k + 1] * frameRect.height()
-                if (k == 0) p.moveTo(x, y) else p.lineTo(x, y)
-            }
-            p.close()
-            line.color = outlineColor
-            canvas.drawPath(p, line)
+        fit(fr.width, fr.height, width.toFloat(), height.toFloat(), width / 2f, height / 2f, r)
+        canvas.drawBitmap(fr, null, r, bmpPaint)
+        if (lostFlag) {
+            line.color = Color.RED
+            canvas.drawRect(r.left + 3, r.top + 3, r.right - 3, r.bottom - 3, line)
         }
 
-        val g = grid ?: return
-        if (cols == 0 || rows == 0) return
-        // Mini-map on the right, vertically centred (safe on round screens).
-        val maxW = width * 0.30f
-        val maxH = height * 0.42f
-        var mw = maxW
-        var mh = mw * pageAspect
-        if (mh > maxH) { mh = maxH; mw = mh / pageAspect }
-        val left = width * 0.93f - mw
-        val top = (height - mh) / 2
-        fill.color = Color.argb(150, 0, 0, 0)
-        canvas.drawRect(left - 4, top - 4, left + mw + 4, top + mh + 4, fill)
-        val cwid = mw / cols
-        val chgt = mh / rows
-        for (i in g.indices) {
-            val c = i % cols
-            val r = i / cols
-            fill.color = when (g[i]) {
-                ScanEngine.GOOD -> Color.argb(230, 60, 200, 90)
-                ScanEngine.BLANK -> Color.argb(150, 40, 110, 70)
-                ScanEngine.LOW -> Color.argb(230, 230, 170, 30)
-                else -> Color.argb(170, 120, 120, 120)
-            }
-            canvas.drawRect(left + c * cwid + 1, top + r * chgt + 1, left + (c + 1) * cwid - 1, top + (r + 1) * chgt - 1, fill)
-        }
+        val m = mosaic ?: return
+        // Page-so-far preview on the right, vertically centred (safe on round screens).
+        fit(m.width, m.height, width * 0.36f, height * 0.42f, width * 0.93f - width * 0.18f, height / 2f, r)
+        fill.color = Color.argb(170, 0, 0, 0)
+        canvas.drawRect(r.left - 4, r.top - 4, r.right + 4, r.bottom + 4, fill)
+        canvas.drawBitmap(m, null, r, bmpPaint)
         footprint?.let { f ->
             val p = Path()
             for (k in 0 until 4) {
-                val x = left + f[2 * k].coerceIn(-0.2f, 1.2f) * mw
-                val y = top + f[2 * k + 1].coerceIn(-0.2f, 1.2f) * mh
+                val x = r.left + f[2 * k].coerceIn(-0.3f, 1.3f) * r.width()
+                val y = r.top + f[2 * k + 1].coerceIn(-0.3f, 1.3f) * r.height()
                 if (k == 0) p.moveTo(x, y) else p.lineTo(x, y)
             }
             p.close()
-            line.color = Color.WHITE
+            line.color = if (lostFlag) Color.RED else Color.rgb(80, 220, 120)
             line.strokeWidth = 3f
             canvas.drawPath(p, line)
             line.strokeWidth = 4f
