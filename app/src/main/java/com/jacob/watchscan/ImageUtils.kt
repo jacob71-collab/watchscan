@@ -17,6 +17,7 @@ import kotlin.math.atan2
 import kotlin.math.ceil
 import kotlin.math.hypot
 import kotlin.math.max
+import kotlin.math.min
 import kotlin.math.roundToInt
 
 // ---------------------------------------------------------------------------
@@ -32,24 +33,33 @@ fun laplaceVar(img: Mat): Double {
     return v * v
 }
 
-/** Removes uneven lighting / vignetting; paper becomes ~245. */
+/**
+ * Removes uneven lighting, vignetting and soft shadows; paper becomes ~245.
+ * The background is estimated by erasing text (local max at about stroke size),
+ * then smoothing, at a working size of at most 900 px.
+ */
 fun flatten(gray: Mat): Mat {
     val w = gray.cols(); val h = gray.rows()
+    val s = min(1.0, 900.0 / max(w, h))
     val small = Mat()
-    Imgproc.resize(gray, small, Size(max(1, w / 8).toDouble(), max(1, h / 8).toDouble()), 0.0, 0.0, Imgproc.INTER_AREA)
-    Imgproc.dilate(small, small, Mat.ones(7, 7, CvType.CV_8U))
-    val med = Mat()
-    Imgproc.medianBlur(small, med, 21)
+    if (s < 1.0) Imgproc.resize(gray, small, Size(w * s, h * s), 0.0, 0.0, Imgproc.INTER_AREA) else gray.copyTo(small)
+    val k = max(5, (min(small.cols(), small.rows()) / 60.0).roundToInt() or 1)
     val bg = Mat()
-    Imgproc.resize(med, bg, Size(w.toDouble(), h.toDouble()), 0.0, 0.0, Imgproc.INTER_LINEAR)
+    Imgproc.dilate(small, bg, Imgproc.getStructuringElement(Imgproc.MORPH_ELLIPSE, Size(k.toDouble(), k.toDouble())))
+    val med = Mat()
+    Imgproc.medianBlur(bg, med, (3 * k) or 1)
+    Imgproc.GaussianBlur(med, bg, Size(0.0, 0.0), k.toDouble())
+    val full = Mat()
+    if (s < 1.0) Imgproc.resize(bg, full, Size(w.toDouble(), h.toDouble()), 0.0, 0.0, Imgproc.INTER_LINEAR) else bg.copyTo(full)
     val out = Mat()
-    Core.divide(gray, bg, out, 245.0)
-    small.release(); med.release(); bg.release()
+    Core.divide(gray, full, out, 245.0)
+    small.release(); bg.release(); med.release(); full.release()
     return out
 }
 
+/** Final touch for a sheet built from lighting-corrected photos: stretch contrast. */
 fun enhance(gray: Mat): Mat {
-    val out = flatten(gray)
+    val out = gray.clone()
     val n = (out.total() * out.channels()).toInt()
     val data = ByteArray(n)
     out.get(0, 0, data)

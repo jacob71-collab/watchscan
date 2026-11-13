@@ -94,6 +94,7 @@ class MainActivity : ComponentActivity() {
     @Volatile private var hasAf = false
     @Volatile private var continuousAf = false
     @Volatile private var camDesc = ""
+    @Volatile private var yuvList = ""
     @Volatile private var lastFocusMs = 0L
 
 
@@ -468,7 +469,7 @@ class MainActivity : ComponentActivity() {
         synchronized(debugFiles) {
             debugFiles.clear(); debugLog.setLength(0); procCount = 0; lastDebugMs = 0L
             if (debugSave) {
-                debugLog.append("camera: $camDesc\nmodel: ${Build.MANUFACTURER} ${Build.MODEL}, Android ${Build.VERSION.RELEASE}\n")
+                debugLog.append("camera: $camDesc\nyuv sizes: $yuvList\nmodel: ${Build.MANUFACTURER} ${Build.MODEL}, Android ${Build.VERSION.RELEASE}\n")
             }
         }
         vibrate(40)
@@ -604,7 +605,6 @@ class MainActivity : ComponentActivity() {
 
     @androidx.annotation.OptIn(markerClass = [ExperimentalCamera2Interop::class])
     private fun bindCamera(provider: ProcessCameraProvider) {
-        val target = if (highRes) Size(2560, 1920) else Size(1920, 1440)
         val wanted = if (useFront) CameraSelector.DEFAULT_FRONT_CAMERA else CameraSelector.DEFAULT_BACK_CAMERA
         val other = if (useFront) CameraSelector.DEFAULT_BACK_CAMERA else CameraSelector.DEFAULT_FRONT_CAMERA
         val camSel = when {
@@ -621,10 +621,21 @@ class MainActivity : ComponentActivity() {
         val fpsRanges = try { c2?.getCameraCharacteristic(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES) } catch (_: Throwable) { null }
         hasAf = minFocus > 0f && (afModes.contains(CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE) || afModes.contains(CaptureRequest.CONTROL_AF_MODE_AUTO))
         continuousAf = afModes.contains(CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+        // Largest frame size the camera can stream for analysis (some watches default to 640x480).
+        val yuvSizes: Array<Size> = try {
+            c2?.getCameraCharacteristic(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+                ?.getOutputSizes(android.graphics.ImageFormat.YUV_420_888)
+        } catch (_: Throwable) { null } ?: emptyArray()
+        val cap = if (highRes) 2560L * 1920 else 1920L * 1440
+        val biggest = yuvSizes.filter { it.width.toLong() * it.height <= cap }.maxByOrNull { it.width.toLong() * it.height }
+        val target = biggest ?: if (highRes) Size(2560, 1920) else Size(1920, 1440)
+        yuvList = yuvSizes.sortedByDescending { it.width * it.height }.joinToString(" ") { "${it.width}x${it.height}" }
+        val ratio = if (target.width * 3 == target.height * 4 || target.height * 3 == target.width * 4)
+            androidx.camera.core.AspectRatio.RATIO_4_3 else androidx.camera.core.AspectRatio.RATIO_16_9
         camDesc = if (hasAf) "autofocus, focuses from ${(100f / minFocus).toInt()} cm" else "fixed focus"
 
         val selector = ResolutionSelector.Builder()
-            .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY)
+            .setAspectRatioStrategy(AspectRatioStrategy(ratio, AspectRatioStrategy.FALLBACK_RULE_AUTO))
             .setResolutionStrategy(ResolutionStrategy(target, ResolutionStrategy.FALLBACK_RULE_CLOSEST_LOWER_THEN_HIGHER))
             .build()
         val builder = ImageAnalysis.Builder()
@@ -725,7 +736,6 @@ class MainActivity : ComponentActivity() {
                                             if (stitcher === st) {
                                                 val pv = st.add(snap.full, snap.px, snap.py, snap.unc)
                                                 joined = st.joined
-                                                corners = st.cornersFound
                                                 if (pv != null) {
                                                     val b = Bitmap.createBitmap(pv.cols(), pv.rows(), Bitmap.Config.ARGB_8888)
                                                     Utils.matToBitmap(pv, b); pv.release()
@@ -814,13 +824,12 @@ class MainActivity : ComponentActivity() {
         val hint = when {
             info.sharp < 0.45 * info.maxSharp -> "Too blurry \u2014 slow down or hold steadier"
             info.count == 0 -> "Start at a corner of the page, then sweep slowly in an S"
-            corners < 4 -> "Sweep in an S, past the paper's edges, so all 4 corners are seen"
-            else -> "All corners seen \u2014 tap Done when the whole page is covered"
+            else -> "Sweep in an S, a little past the paper's edges; tap Done when covered"
         }
         if (info.newSnap != null) vibrate(15)
         runOnUiThread {
             if (mode != Mode.SWEEP) return@runOnUiThread
-            statusText.text = "${info.count} photos \u00b7 $joined joined \u00b7 corners $corners/4\n$hint\n$diag"
+            statusText.text = "${info.count} photos \u00b7 $joined joined\n$hint\n$diag"
             if (thumb != null) scanView.setMosaic(thumb)
             scanView.setFootprint(null, info.sharp < 0.45 * info.maxSharp)
         }
