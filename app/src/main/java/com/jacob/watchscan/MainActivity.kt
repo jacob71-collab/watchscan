@@ -9,7 +9,9 @@ import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.os.Build
 import android.os.Bundle
+import android.os.Environment
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.provider.MediaStore
@@ -37,6 +39,7 @@ import androidx.camera.core.resolutionselector.AspectRatioStrategy
 import androidx.camera.core.resolutionselector.ResolutionSelector
 import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.core.content.ContextCompat
 import org.opencv.android.OpenCVLoader
 import org.opencv.android.Utils
 import org.opencv.core.Core
@@ -277,7 +280,12 @@ class MainActivity : ComponentActivity() {
         try {
             @Suppress("DEPRECATION")
             val v = getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator
-            v?.vibrate(VibrationEffect.createOneShot(ms, VibrationEffect.DEFAULT_AMPLITUDE))
+            if (Build.VERSION.SDK_INT >= 26) {
+                v?.vibrate(VibrationEffect.createOneShot(ms, VibrationEffect.DEFAULT_AMPLITUDE))
+            } else {
+                @Suppress("DEPRECATION")
+                v?.vibrate(ms)
+            }
         } catch (_: Exception) {
         }
     }
@@ -455,6 +463,12 @@ class MainActivity : ComponentActivity() {
 
     private fun saveJpeg(bytes: ByteArray) {
         val name = "scan_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date()) + ".jpg"
+        if (Build.VERSION.SDK_INT < 29) {
+            // Older Android: keep scans in the app's own Pictures folder (no storage permission needed).
+            val dir = getExternalFilesDir(Environment.DIRECTORY_PICTURES) ?: return
+            java.io.File(dir, name).writeBytes(bytes)
+            return
+        }
         val values = ContentValues().apply {
             put(MediaStore.Images.Media.DISPLAY_NAME, name)
             put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
@@ -478,7 +492,7 @@ class MainActivity : ComponentActivity() {
             } catch (t: Throwable) {
                 setStatus("Camera error: ${t.message}")
             }
-        }, mainExecutor)
+        }, ContextCompat.getMainExecutor(this))
     }
 
     private fun bindCamera(provider: ProcessCameraProvider) {

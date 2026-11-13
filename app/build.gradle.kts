@@ -11,7 +11,7 @@ android {
 
     defaultConfig {
         applicationId = "com.jacob.watchscan"
-        minSdk = 29
+        minSdk = 24
         targetSdk = 34
         versionCode = buildNumber
         versionName = "0.1.$buildNumber"
