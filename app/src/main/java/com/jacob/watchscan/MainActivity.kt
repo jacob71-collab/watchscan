@@ -277,6 +277,7 @@ class MainActivity : ComponentActivity() {
         }, lp())
         settingsBox.addView(makeButton("Save test frames: " + if (debugSave) "on" else "off") {
             prefs.edit().putBoolean("debug", !debugSave).apply(); rebuildSettings()
+            if (debugSave) toast("On. Do a scan and tap Done; the zip is saved before the page is joined.")
         }, lp())
         settingsBox.addView(makeButton("Share last test zip") { shareZip() }, lp())
         settingsBox.addView(makeButton("Save scans: " + if (saveScans) "on" else "off") {
@@ -314,8 +315,8 @@ class MainActivity : ComponentActivity() {
     private fun setStatus(s: String) = runOnUiThread { statusText.text = s }
 
     private fun shareZip() {
-        val uri = lastZip
-        if (uri == null) { toast("No test zip yet. Turn on Save test frames, scan once, then try again."); return }
+        val uri = lastZip ?: prefs.getString("last_zip", null)?.let { android.net.Uri.parse(it) } ?: newestZip()
+        if (uri == null) { toast("No test zip yet. Turn on Save test frames, then do a scan and tap Done."); return }
         val send = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
             type = "application/zip"
             putExtra(android.content.Intent.EXTRA_STREAM, uri)
@@ -323,6 +324,21 @@ class MainActivity : ComponentActivity() {
         }
         try { startActivity(android.content.Intent.createChooser(send, "Share test zip")) }
         catch (_: Throwable) { toast("No app on this watch can share files.") }
+    }
+
+    /** Newest watchscan_test zip in the Downloads collection, if any. */
+    private fun newestZip(): android.net.Uri? {
+        if (Build.VERSION.SDK_INT < 29) return null
+        return try {
+            contentResolver.query(
+                MediaStore.Downloads.EXTERNAL_CONTENT_URI,
+                arrayOf(MediaStore.MediaColumns._ID),
+                "${MediaStore.MediaColumns.DISPLAY_NAME} LIKE ?", arrayOf("watchscan_test_%"),
+                "${MediaStore.MediaColumns.DATE_ADDED} DESC"
+            )?.use { c ->
+                if (c.moveToFirst()) android.content.ContentUris.withAppendedId(MediaStore.Downloads.EXTERNAL_CONTENT_URI, c.getLong(0)) else null
+            }
+        } catch (_: Throwable) { null }
     }
 
     private fun toast(s: String) = runOnUiThread {
@@ -448,6 +464,18 @@ class MainActivity : ComponentActivity() {
                     showAnswer("No photos were taken. Hold the watch steady over the page for a moment, then sweep slowly. Tap New scan to try again.")
                     return@execute
                 }
+                if (debugSave) {
+                    // Save the photos first, so they're kept even if joining fails.
+                    setStatus("Saving test photos\u2026")
+                    val msg = try {
+                        val n = writeDebugZip(st.photoJpegs(), st.describe())
+                        "Test zip saved: Download/WatchScan/$n"
+                    } catch (t: Throwable) {
+                        "Couldn't save the test zip: ${t.message ?: t.javaClass.simpleName}"
+                    }
+                    toast(msg)
+                    setStatus("Joining ${st.count} photos into one page\u2026")
+                }
                 val result = st.result()
                 val ps = min(1.0, 900.0 / max(result.cols(), result.rows()))
                 val prev = Mat()
@@ -458,15 +486,6 @@ class MainActivity : ComponentActivity() {
                 runOnUiThread { scanView.clearOverlays(); scanView.setStill(bmp) }
                 if (saveScans) {
                     try { saveJpeg(encodeJpeg(result, 92)) } catch (t: Throwable) { /* not fatal */ }
-                }
-                if (debugSave) {
-                    setStatus("Saving test photos\u2026")
-                    synchronized(debugFiles) {
-                        debugFiles.clear()
-                        st.photoJpegs().forEachIndexed { i, j -> debugFiles.add("%02d_photo.jpg".format(i + 1) to j) }
-                        debugLog.append(st.describe()).append("\n")
-                    }
-                    try { writeDebugZip(result) } catch (t: Throwable) { /* not fatal */ }
                 }
                 val extras = if (st.placed < st.count) st.unplacedPhotos(6) else emptyList()
 
@@ -732,39 +751,36 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    /** Writes the recorded test frames + log as one zip in Download/WatchScan. */
-    private fun writeDebugZip(result: Mat?) {
-        val files: List<Pair<String, ByteArray>>
-        val log: String
-        synchronized(debugFiles) {
-            if (debugFiles.isEmpty()) return
-            files = ArrayList(debugFiles)
-            log = debugLog.toString()
-            debugFiles.clear()
-        }
-        val bos = java.io.ByteArrayOutputStream()
-        java.util.zip.ZipOutputStream(bos).use { z ->
-            fun put(name: String, data: ByteArray) {
-                z.putNextEntry(java.util.zip.ZipEntry(name)); z.write(data); z.closeEntry()
-            }
-            for ((n, d) in files) put(n, d)
-            if (result != null) put("00_result.jpg", encodeJpeg(result, 90))
-            put("log.txt", log.toByteArray())
-        }
+    /** Writes the photos + log as one zip in Download/WatchScan, streamed to disk. Returns the file name. */
+    private fun writeDebugZip(photos: List<ByteArray>, summary: String): String {
+        val log = synchronized(debugFiles) { debugLog.toString() } + summary + "\n"
         val name = "watchscan_test_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date()) + ".zip"
+        val out: java.io.OutputStream
+        var uri: android.net.Uri? = null
         if (Build.VERSION.SDK_INT >= 29) {
             val values = ContentValues().apply {
                 put(MediaStore.MediaColumns.DISPLAY_NAME, name)
                 put(MediaStore.MediaColumns.MIME_TYPE, "application/zip")
                 put(MediaStore.MediaColumns.RELATIVE_PATH, "Download/WatchScan")
             }
-            val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values) ?: return
-            contentResolver.openOutputStream(uri)?.use { it.write(bos.toByteArray()) }
-            lastZip = uri
+            uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                ?: throw java.io.IOException("the watch refused to create the file")
+            out = contentResolver.openOutputStream(uri) ?: throw java.io.IOException("couldn't open the file")
         } else {
-            val dir = getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS) ?: return
-            java.io.File(dir, name).writeBytes(bos.toByteArray())
+            val dir = getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS) ?: throw java.io.IOException("no storage")
+            out = java.io.FileOutputStream(java.io.File(dir, name))
         }
+        java.util.zip.ZipOutputStream(java.io.BufferedOutputStream(out)).use { z ->
+            photos.forEachIndexed { i, d ->
+                z.putNextEntry(java.util.zip.ZipEntry("%02d_photo.jpg".format(i + 1))); z.write(d); z.closeEntry()
+            }
+            z.putNextEntry(java.util.zip.ZipEntry("log.txt")); z.write(log.toByteArray()); z.closeEntry()
+        }
+        if (uri != null) {
+            lastZip = uri
+            prefs.edit().putString("last_zip", uri.toString()).apply()
+        }
+        return name
     }
 
     private fun onInfo(info: SnapshotCollector.Info, diag: String, thumb: Bitmap?) {
