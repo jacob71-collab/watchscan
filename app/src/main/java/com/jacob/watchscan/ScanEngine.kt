@@ -49,6 +49,7 @@ class ScanEngine {
         const val GOOD_F = 1.35       // canvas px per frame px for a cell to count as "good"
         const val ZMIN = 0.6          // min agreement between a new patch and the canvas
         const val FINE_MAXW = 400.0   // template width for the ECC refinement
+        const val MAX_SHOTS = 4       // close-ups sent to Claude with the page
 
         const val EMPTY = 0
         const val LOW = 1
@@ -72,6 +73,11 @@ class ScanEngine {
         /** Page corners in the frame, normalised 0..1 (8 values) or null. */
         val pageInFrame: FloatArray?,
     )
+
+    /** A sharp close-up kept to send to Claude alongside the stitched page. */
+    class Shot(val jpeg: ByteArray, val cx: Float, val cy: Float, val q: Double)
+
+    val shots = ArrayList<Shot>()
 
     private val orbRef = ORB.create(4000, 1.2f, 8, 31, 0, 2, 0, 31, 8)
     private val orb = ORB.create(1500, 1.2f, 8, 31, 0, 2, 0, 31, 8)
@@ -291,6 +297,7 @@ class ScanEngine {
                 updated++
             }
             patch.release()
+            keepShot(flat, hc, sharp, f)
             flat.release()
             if (updated > 0) {
                 Imgproc.resize(canvas, canvasSmall, Size(rw.toDouble(), rh.toDouble()), 0.0, 0.0, Imgproc.INTER_AREA)
@@ -313,6 +320,34 @@ class ScanEngine {
             page[2 * k + 1] = (hinv.mapY(px[k], py[k]) / h).toFloat()
         }
         return info(true, accepted, f, updated, foot, page)
+    }
+
+    /**
+     * Keeps up to MAX_SHOTS sharp close-ups spread over the page. A new frame replaces a
+     * nearby one only if it is clearly sharper.
+     */
+    private fun keepShot(flat: Mat, hc: H, sharp: Double, f: Double) {
+        if (f > 1.6) return // too far away to add detail over the stitched page
+        val w = flat.cols().toDouble(); val h = flat.rows().toDouble()
+        val cx = (hc.mapX(w / 2, h / 2) / cw).toFloat()
+        val cy = (hc.mapY(w / 2, h / 2) / ch).toFloat()
+        if (cx < 0f || cx > 1f || cy < 0f || cy > 1f) return
+        val near = shots.indices.minByOrNull { hypot((shots[it].cx - cx).toDouble(), (shots[it].cy - cy).toDouble()) }
+        val nearD = near?.let { hypot((shots[it].cx - cx).toDouble(), (shots[it].cy - cy).toDouble()) } ?: 9.0
+        val slot: Int = when {
+            nearD < 0.3 -> if (sharp > shots[near!!].q * 1.15) near!! else return
+            shots.size < MAX_SHOTS -> -1
+            else -> {
+                val worst = shots.indices.minByOrNull { shots[it].q } ?: return
+                if (sharp > shots[worst].q * 1.15) worst else return
+            }
+        }
+        val (tw, th) = sizeForClaude(flat.cols(), flat.rows(), 1568, 2400)
+        val small = Mat()
+        Imgproc.resize(flat, small, Size(tw.toDouble(), th.toDouble()), 0.0, 0.0, Imgproc.INTER_AREA)
+        val shot = Shot(encodeJpeg(small, 85), cx, cy, sharp)
+        small.release()
+        if (slot < 0) shots.add(shot) else shots[slot] = shot
     }
 
     private fun info(ok: Boolean, acc: Boolean, f: Double, upd: Int, foot: FloatArray?, page: FloatArray?): Info {

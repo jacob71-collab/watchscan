@@ -32,7 +32,16 @@ import android.widget.TextView
 import androidx.activity.ComponentActivity
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
+import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CaptureRequest
+import android.util.Range
+import androidx.camera.camera2.interop.Camera2CameraInfo
+import androidx.camera.camera2.interop.Camera2Interop
+import androidx.camera.camera2.interop.ExperimentalCamera2Interop
+import androidx.camera.core.Camera
 import androidx.camera.core.CameraSelector
+import androidx.camera.core.FocusMeteringAction
+import androidx.camera.core.SurfaceOrientedMeteringPointFactory
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
 import androidx.camera.core.resolutionselector.AspectRatioStrategy
@@ -53,6 +62,7 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.max
 import kotlin.math.min
@@ -80,6 +90,11 @@ class MainActivity : ComponentActivity() {
     private val workExec = Executors.newSingleThreadExecutor()
     private val busy = AtomicBoolean(false)
     private var cameraProvider: ProcessCameraProvider? = null
+    @Volatile private var camera: Camera? = null
+    @Volatile private var hasAf = false
+    @Volatile private var continuousAf = false
+    @Volatile private var camDesc = ""
+    @Volatile private var lastFocusMs = 0L
 
     private val lock = Any()
     private var lastFrame: Mat? = null
@@ -103,7 +118,8 @@ class MainActivity : ComponentActivity() {
     private val apiKey get() = prefs.getString("api_key", "") ?: ""
     private val model get() = prefs.getString("model", ClaudeClient.MODELS[0].first) ?: ClaudeClient.MODELS[0].first
     private val useFront get() = prefs.getBoolean("front", false)
-    private val highRes get() = prefs.getBoolean("high_res", false)
+    private val highRes get() = prefs.getBoolean("high_res", true)
+    private val torch get() = prefs.getBoolean("torch", false)
     private val saveScans get() = prefs.getBoolean("save", true)
 
     // ---------------------------------------------------------------- lifecycle
@@ -159,6 +175,7 @@ class MainActivity : ComponentActivity() {
         val root = FrameLayout(this)
         root.setBackgroundColor(Color.BLACK)
         scanView = ScanView(this)
+        scanView.setOnClickListener { focusCentre() }
         root.addView(scanView, FrameLayout.LayoutParams(-1, -1))
 
         statusText = TextView(this).apply {
@@ -242,6 +259,12 @@ class MainActivity : ComponentActivity() {
         settingsBox.addView(makeButton("Detail: " + if (highRes) "high (slower)" else "normal") {
             prefs.edit().putBoolean("high_res", !highRes).apply(); rebuildSettings(); startCamera()
         }, lp())
+        settingsBox.addView(makeButton("Flashlight: " + if (torch) "on" else "off") {
+            prefs.edit().putBoolean("torch", !torch).apply(); rebuildSettings()
+            val c = camera
+            if (c != null && c.cameraInfo.hasFlashUnit()) c.cameraControl.enableTorch(torch)
+            else if (torch) toast("This camera has no flashlight.")
+        }, lp())
         settingsBox.addView(makeButton("Save scans: " + if (saveScans) "on" else "off") {
             prefs.edit().putBoolean("save", !saveScans).apply(); rebuildSettings()
         }, lp())
@@ -275,6 +298,25 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun setStatus(s: String) = runOnUiThread { statusText.text = s }
+
+    private fun toast(s: String) = runOnUiThread {
+        android.widget.Toast.makeText(this, s, android.widget.Toast.LENGTH_SHORT).show()
+    }
+
+    /** Ask the camera to focus (and meter) on the centre of the view. */
+    private fun focusCentre() {
+        val c = camera ?: return
+        if (!hasAf) return
+        lastFocusMs = System.currentTimeMillis()
+        try {
+            val pt = SurfaceOrientedMeteringPointFactory(1f, 1f).createPoint(0.5f, 0.5f, 0.3f)
+            val action = FocusMeteringAction.Builder(pt, FocusMeteringAction.FLAG_AF or FocusMeteringAction.FLAG_AE)
+                .setAutoCancelDuration(3, TimeUnit.SECONDS)
+                .build()
+            c.cameraControl.startFocusAndMetering(action)
+        } catch (_: Throwable) {
+        }
+    }
 
     private fun vibrate(ms: Long) {
         try {
@@ -419,6 +461,7 @@ class MainActivity : ComponentActivity() {
                     )
                     return@execute
                 }
+                val closeUps = e.shots.sortedBy { it.cy * 10 + it.cx }.map { it.jpeg }
                 val (tw, th) = sizeForClaude(result.cols(), result.rows())
                 val small = Mat()
                 Imgproc.resize(result, small, CvSize(tw.toDouble(), th.toDouble()), 0.0, 0.0, Imgproc.INTER_AREA)
@@ -428,7 +471,7 @@ class MainActivity : ComponentActivity() {
                 val modelName = ClaudeClient.MODELS.firstOrNull { it.first == model }?.second ?: model
                 setStatus("Asking Claude ($modelName)…")
                 val answer = try {
-                    ClaudeClient.ask(key, model, jpeg)
+                    ClaudeClient.ask(key, model, jpeg, closeUps)
                 } catch (t: Throwable) {
                     "Couldn't get an answer.\n\n${t.message ?: t.javaClass.simpleName}\n\nCheck the watch's internet connection, then tap New scan to try again."
                 }
@@ -495,19 +538,9 @@ class MainActivity : ComponentActivity() {
         }, ContextCompat.getMainExecutor(this))
     }
 
+    @androidx.annotation.OptIn(markerClass = [ExperimentalCamera2Interop::class])
     private fun bindCamera(provider: ProcessCameraProvider) {
         val target = if (highRes) Size(2560, 1920) else Size(1920, 1440)
-        val selector = ResolutionSelector.Builder()
-            .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY)
-            .setResolutionStrategy(ResolutionStrategy(target, ResolutionStrategy.FALLBACK_RULE_CLOSEST_LOWER_THEN_HIGHER))
-            .build()
-        val analysis = ImageAnalysis.Builder()
-            .setResolutionSelector(selector)
-            .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-            .build()
-        analysis.setAnalyzer(analyzerExec) { img ->
-            try { analyze(img) } catch (t: Throwable) { setStatus("Error: ${t.message}") } finally { img.close() }
-        }
         val wanted = if (useFront) CameraSelector.DEFAULT_FRONT_CAMERA else CameraSelector.DEFAULT_BACK_CAMERA
         val other = if (useFront) CameraSelector.DEFAULT_BACK_CAMERA else CameraSelector.DEFAULT_FRONT_CAMERA
         val camSel = when {
@@ -515,8 +548,40 @@ class MainActivity : ComponentActivity() {
             safeHas(provider, other) -> other
             else -> { setStatus("No camera found."); return }
         }
+        // Read what this camera can do: autofocus, nearest focus distance, frame-rate ranges.
+        val c2 = try {
+            camSel.filter(provider.availableCameraInfos).firstOrNull()?.let { Camera2CameraInfo.from(it) }
+        } catch (_: Throwable) { null }
+        val afModes = try { c2?.getCameraCharacteristic(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES) } catch (_: Throwable) { null } ?: IntArray(0)
+        val minFocus = try { c2?.getCameraCharacteristic(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE) } catch (_: Throwable) { null } ?: 0f
+        val fpsRanges = try { c2?.getCameraCharacteristic(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES) } catch (_: Throwable) { null }
+        hasAf = minFocus > 0f && (afModes.contains(CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE) || afModes.contains(CaptureRequest.CONTROL_AF_MODE_AUTO))
+        continuousAf = afModes.contains(CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+        camDesc = if (hasAf) "autofocus, focuses from ${(100f / minFocus).toInt()} cm" else "fixed focus"
+
+        val selector = ResolutionSelector.Builder()
+            .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY)
+            .setResolutionStrategy(ResolutionStrategy(target, ResolutionStrategy.FALLBACK_RULE_CLOSEST_LOWER_THEN_HIGHER))
+            .build()
+        val builder = ImageAnalysis.Builder()
+            .setResolutionSelector(selector)
+            .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+        val ext = Camera2Interop.Extender(builder)
+        if (afModes.contains(CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)) {
+            ext.setCaptureRequestOption(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+        }
+        // Prefer a fast, fixed frame rate: it caps the exposure time, which cuts motion blur.
+        val fast: Range<Int>? = fpsRanges?.filter { it.lower >= 20 }?.maxWithOrNull(compareBy<Range<Int>>({ it.lower }, { -it.upper }))
+        if (fast != null) ext.setCaptureRequestOption(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, fast)
+        val analysis = builder.build()
+        analysis.setAnalyzer(analyzerExec) { img ->
+            try { analyze(img) } catch (t: Throwable) { setStatus("Error: ${t.message}") } finally { img.close() }
+        }
         provider.unbindAll()
-        provider.bindToLifecycle(this, camSel, analysis)
+        frameCount = 0
+        val cam = provider.bindToLifecycle(this, camSel, analysis)
+        camera = cam
+        if (cam.cameraInfo.hasFlashUnit()) cam.cameraControl.enableTorch(torch)
     }
 
     private fun safeHas(p: ProcessCameraProvider, s: CameraSelector) = try { p.hasCamera(s) } catch (_: Exception) { false }
@@ -557,9 +622,12 @@ class MainActivity : ComponentActivity() {
         }
         frameCount++
         if (frameCount == 1) {
-            val res = "${up.cols()}x${up.rows()}"
-            if (mode == Mode.OVERVIEW) setStatus("Camera $res. Fit the whole page in view, then tap Capture")
+            camDesc = "${up.cols()}x${up.rows()}, " + camDesc
+            if (mode == Mode.OVERVIEW) setStatus("Camera $camDesc\nFit the whole page in view, then tap Capture")
         }
+        // Cameras without continuous autofocus need a nudge every few seconds.
+        if (!continuousAf && (mode == Mode.SWEEP || mode == Mode.OVERVIEW) &&
+            System.currentTimeMillis() - lastFocusMs > 2500) focusCentre()
 
         // Viewfinder
         val vw = max(160, min(480, scanView.width))
@@ -636,7 +704,8 @@ class MainActivity : ComponentActivity() {
         val pct = 100 * info.good / max(1, info.total)
         val hint = when {
             !info.ok -> "Lost the page — move back a little so more text is visible"
-            info.f > ScanEngine.GOOD_F -> "Move closer to the paper"
+            info.f > ScanEngine.GOOD_F && hasAf -> "Move closer to the paper"
+            info.f > ScanEngine.GOOD_F -> "Move a bit closer, but stop before the view gets blurry"
             !info.accepted -> "Hold steady…"
             else -> "Sweep over the yellow/grey areas"
         }

@@ -23,21 +23,35 @@ Your reply is shown on a tiny round watch screen and may be read aloud, so:
 - Plain text only. No Markdown, no tables, no LaTeX.
 - If part of the page is unreadable or cut off, say which part, and answer what you can."""
 
-    fun ask(apiKey: String, model: String, jpeg: ByteArray): String {
-        val image = JSONObject()
-            .put("type", "image")
-            .put(
-                "source", JSONObject()
-                    .put("type", "base64")
-                    .put("media_type", "image/jpeg")
-                    .put("data", Base64.encodeToString(jpeg, Base64.NO_WRAP))
+    private fun imageBlock(jpeg: ByteArray) = JSONObject()
+        .put("type", "image")
+        .put(
+            "source", JSONObject()
+                .put("type", "base64")
+                .put("media_type", "image/jpeg")
+                .put("data", Base64.encodeToString(jpeg, Base64.NO_WRAP))
+        )
+
+    /** [page] is the stitched full page; [closeUps] are sharp close-up photos of parts of it. */
+    fun ask(apiKey: String, model: String, page: ByteArray, closeUps: List<ByteArray> = emptyList()): String {
+        val content = JSONArray()
+        content.put(JSONObject().put("type", "text").put("text", "Full page (stitched from many close-up frames):"))
+        content.put(imageBlock(page))
+        if (closeUps.isNotEmpty()) {
+            content.put(
+                JSONObject().put("type", "text").put(
+                    "text",
+                    "Close-up photos of parts of the same page (sharper, use them to read small or unclear text):"
+                )
             )
-        val text = JSONObject().put("type", "text").put("text", "Answer the question(s) on this page.")
+            for (c in closeUps) content.put(imageBlock(c))
+        }
+        content.put(JSONObject().put("type", "text").put("text", "Answer the question(s) on this page."))
         val body = JSONObject()
             .put("model", model)
             .put("max_tokens", 1500)
             .put("system", SYSTEM)
-            .put("messages", JSONArray().put(JSONObject().put("role", "user").put("content", JSONArray().put(image).put(text))))
+            .put("messages", JSONArray().put(JSONObject().put("role", "user").put("content", content)))
 
         val conn = URL("https://api.anthropic.com/v1/messages").openConnection() as HttpsURLConnection
         try {
