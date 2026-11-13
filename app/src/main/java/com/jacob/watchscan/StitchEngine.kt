@@ -161,16 +161,17 @@ class StitchEngine {
         return sqrt(v.sumOf { (it - mean) * (it - mean) } / max(1, v.size))
     }
 
-    /** Two handheld shots of a flat page from a similar distance: moderate scale change, mild perspective. */
+    /** Two handheld shots of a flat page: scale change and tilt within generous limits. */
     private fun plausible(h: H, w: Int, hh: Int): Boolean {
         val xs = doubleArrayOf(0.0, w.toDouble(), w.toDouble(), 0.0)
         val ys = doubleArrayOf(0.0, 0.0, hh.toDouble(), hh.toDouble())
         val qx = DoubleArray(4) { h.mapX(xs[it], ys[it]) }; val qy = DoubleArray(4) { h.mapY(xs[it], ys[it]) }
         if (!isConvex(qx, qy)) return false
         val r = polyArea(qx, qy) / (w.toDouble() * hh)
-        if (r < 0.36 || r > 2.8) return false
+        if (r < 0.25 || r > 4.0) return false
+        // Opposite sides may differ by up to 2x: allows holding the watch at a fair tilt.
         val side = DoubleArray(4) { hypot(qx[(it + 1) % 4] - qx[it], qy[(it + 1) % 4] - qy[it]) }
-        return max(side[0], side[2]) / min(side[0], side[2]) < 1.5 && max(side[1], side[3]) / min(side[1], side[3]) < 1.5
+        return max(side[0], side[2]) / min(side[0], side[2]) < 2.0 && max(side[1], side[3]) / min(side[1], side[3]) < 2.0
     }
 
     // ------------------------------------------------------------------ global placement
