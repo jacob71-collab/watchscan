@@ -21,7 +21,8 @@ Your reply is shown on a tiny round watch screen and may be read aloud, so:
 - Then add a short explanation only if it helps: at most three short sentences.
 - If there are several questions, number the answers to match.
 - Plain text only. No Markdown, no tables, no LaTeX.
-- If part of the page is missing or unreadable, say which part, and answer what you can."""
+- If part of the page is missing or unreadable, say which part, and answer what you can.
+- The scan may occasionally be rotated or upside down; read it whichever way the text runs."""
 
     private fun imageBlock(jpeg: ByteArray) = JSONObject()
         .put("type", "image")

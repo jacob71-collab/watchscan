@@ -19,6 +19,7 @@ import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
+import kotlin.math.sqrt
 
 // ---------------------------------------------------------------------------
 // Shared image helpers
@@ -205,4 +206,104 @@ fun encodeJpeg(img: Mat, quality: Int): ByteArray {
     val buf = MatOfByte()
     Imgcodecs.imencode(".jpg", img, buf, MatOfInt(Imgcodecs.IMWRITE_JPEG_QUALITY, quality))
     return buf.toArray()
+}
+
+// ---------------------------------------------------------------------------
+// Page orientation (works out which way up the text is)
+
+object Orientation {
+    /** Character-sized dark marks only (drops shadows, background texture and big blobs). */
+    private fun inkMask(gray: Mat): Mat {
+        val s = 1000.0 / max(gray.cols(), gray.rows())
+        val g = Mat()
+        Imgproc.resize(gray, g, Size(gray.cols() * s, gray.rows() * s), 0.0, 0.0, Imgproc.INTER_AREA)
+        val m = Mat()
+        Imgproc.adaptiveThreshold(g, m, 255.0, Imgproc.ADAPTIVE_THRESH_MEAN_C, Imgproc.THRESH_BINARY_INV, 25, 15.0)
+        val labels = Mat(); val stats = Mat(); val cents = Mat()
+        val n = Imgproc.connectedComponentsWithStats(m, labels, stats, cents, 8, CvType.CV_32S)
+        val w = m.cols(); val h = m.rows()
+        val keep = BooleanArray(n)
+        for (i in 1 until n) {
+            val ch = stats.get(i, Imgproc.CC_STAT_HEIGHT)[0]; val cw = stats.get(i, Imgproc.CC_STAT_WIDTH)[0]
+            val a = stats.get(i, Imgproc.CC_STAT_AREA)[0]
+            keep[i] = ch < 0.035 * h && cw < 0.08 * w && a >= 4 && ch >= 2
+        }
+        val lab = IntArray(w * h); labels.get(0, 0, lab)
+        val out = ByteArray(w * h)
+        val bx = (0.04 * w).toInt(); val by = (0.03 * h).toInt() // ignore marks at the very edges
+        for (y in by until h - by) for (x in bx until w - bx) {
+            if (keep[lab[y * w + x]]) out[y * w + x] = 1
+        }
+        val res = Mat(h, w, CvType.CV_8UC1); res.put(0, 0, out)
+        g.release(); m.release(); labels.release(); stats.release(); cents.release()
+        return res
+    }
+
+    private fun rowSums(m: Mat): DoubleArray {
+        val w = m.cols(); val h = m.rows()
+        val a = ByteArray(w * h); m.get(0, 0, a)
+        return DoubleArray(h) { y -> var s = 0.0; for (x in 0 until w) s += a[y * w + x]; s }
+    }
+
+    /** How strongly the marks form horizontal lines (high when text runs left to right). */
+    private fun lineScore(m: Mat): Double {
+        val p = rowSums(m)
+        val mean = p.average()
+        val sd = sqrt(p.sumOf { (it - mean) * (it - mean) } / max(1, p.size))
+        return sd / (mean + 1e-6)
+    }
+
+    /** Positive when lines start more evenly than they end (normal left-aligned text). */
+    private fun leftAlignment(m: Mat): Double {
+        val w = m.cols(); val h = m.rows()
+        val a = ByteArray(w * h); m.get(0, 0, a)
+        val p = rowSums(m)
+        val pmax = p.maxOrNull() ?: 0.0
+        val lines = ArrayList<Pair<Int, Int>>()
+        var start = -1
+        for (y in 0..h) {
+            val on = y < h && p[y] > 0.02 * pmax
+            if (on && start < 0) start = y
+            if (!on && start >= 0) { if (y - start >= 3) lines.add(start to y); start = -1 }
+        }
+        val left = ArrayList<Int>(); val right = ArrayList<Int>()
+        for ((y0, y1) in lines) {
+            var first = -1; var last = -1
+            for (x in 0 until w) {
+                var any = false
+                for (y in y0 until y1) if (a[y * w + x].toInt() != 0) { any = true; break }
+                if (any) { if (first < 0) first = x; last = x }
+            }
+            if (first >= 0 && last - first > 10) { left.add(first); right.add(last) }
+        }
+        if (left.size < 4) return 0.0
+        val tol = 0.012 * w
+        fun clustered(v: List<Int>): Double = v.maxOf { c -> v.count { abs(it - c) < tol } }.toDouble() / v.size
+        return clustered(left) - clustered(right)
+    }
+
+    private fun rot(m: Mat, k: Int): Mat {
+        val o = Mat()
+        when (k % 4) {
+            1 -> Core.rotate(m, o, Core.ROTATE_90_COUNTERCLOCKWISE)
+            2 -> Core.rotate(m, o, Core.ROTATE_180)
+            3 -> Core.rotate(m, o, Core.ROTATE_90_CLOCKWISE)
+            else -> m.copyTo(o)
+        }
+        return o
+    }
+
+    /** Quarter turns (counter-clockwise) that make the page upright. */
+    fun quarterTurns(page: Mat): Int {
+        val m = inkMask(page)
+        val r1 = rot(m, 1)
+        var k = if (lineScore(r1) > lineScore(m)) 1 else 0
+        val mk = if (k == 1) r1 else m
+        if (leftAlignment(mk) < 0) k += 2
+        m.release(); r1.release()
+        return k % 4
+    }
+
+    /** Returns the page turned upright (a new Mat). */
+    fun upright(page: Mat): Mat = rot(page, quarterTurns(page))
 }

@@ -570,7 +570,11 @@ class StitchEngine {
         mos.release(); valid.release()
         val e = enhance(straight)
         straight.release()
-        return e
+        if (page == null) return e // without a clean page outline, background bits could mislead the check
+        // Photos may have been taken with the watch upside down or sideways: turn the page upright.
+        val up = try { Orientation.upright(e) } catch (_: Throwable) { return e }
+        e.release()
+        return up
     }
 
     private fun percentileMasked(img: Mat, mask: Mat, p: Double): Double {
