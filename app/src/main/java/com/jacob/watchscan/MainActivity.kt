@@ -111,8 +111,9 @@ class MainActivity : ComponentActivity() {
     private var lastAnswer = ""
     private var cvOk = false
 
-    private val askPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
-        if (granted) startCamera() else setStatus("Camera permission is needed. Allow it in system settings.")
+    private val askPermissions = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { _ ->
+        if (checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) startCamera()
+        else setStatus("Camera permission is needed. Allow it in system settings.")
     }
 
     // ---------------------------------------------------------------- settings
@@ -153,8 +154,12 @@ class MainActivity : ComponentActivity() {
 
         if (apiKey.isEmpty()) enterMode(Mode.KEY_QR) else enterMode(Mode.READY)
 
-        if (checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) startCamera()
-        else askPermission.launch(Manifest.permission.CAMERA)
+        val needed = ArrayList<String>()
+        if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) needed.add(Manifest.permission.CAMERA)
+        if (Build.VERSION.SDK_INT < 29 && checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED) {
+            needed.add(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+        }
+        if (needed.isEmpty()) startCamera() else askPermissions.launch(needed.toTypedArray())
     }
 
     override fun onDestroy() {
@@ -315,7 +320,9 @@ class MainActivity : ComponentActivity() {
     private fun setStatus(s: String) = runOnUiThread { statusText.text = s }
 
     private fun shareZip() {
+        val oldFile = prefs.getString("last_zip_file", null)?.let { java.io.File(it) }?.takeIf { it.exists() }
         val uri = lastZip ?: prefs.getString("last_zip", null)?.let { android.net.Uri.parse(it) } ?: newestZip()
+            ?: oldFile?.let { androidx.core.content.FileProvider.getUriForFile(this, "com.jacob.watchscan.files", it) }
         if (uri == null) { toast("No test zip yet. Turn on Save test frames, then do a scan and tap Done."); return }
         val send = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
             type = "application/zip"
@@ -323,7 +330,29 @@ class MainActivity : ComponentActivity() {
             addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
         }
         try { startActivity(android.content.Intent.createChooser(send, "Share test zip")) }
-        catch (_: Throwable) { toast("No app on this watch can share files.") }
+        catch (_: Throwable) {
+            toast("No app on this watch can share files." + (oldFile?.let { " The zip is at ${it.absolutePath}" } ?: ""))
+        }
+    }
+
+    /**
+     * Android 9 and older: a WatchScan folder in the shared Pictures/Download folder if we may
+     * write there, otherwise the app's own folder.
+     */
+    private fun legacyDir(type: String): java.io.File {
+        val shared = checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
+        @Suppress("DEPRECATION")
+        val base = if (shared) Environment.getExternalStoragePublicDirectory(type) else getExternalFilesDir(type)
+        val dir = java.io.File(base ?: filesDir, "WatchScan")
+        dir.mkdirs()
+        return dir
+    }
+
+    private fun legacyWrite(type: String, name: String, write: (java.io.OutputStream) -> Unit): java.io.File {
+        val f = java.io.File(legacyDir(type), name)
+        java.io.FileOutputStream(f).use { write(it) }
+        android.media.MediaScannerConnection.scanFile(this, arrayOf(f.absolutePath), null, null)
+        return f
     }
 
     /** Newest watchscan_test zip in the Downloads collection, if any. */
@@ -469,7 +498,7 @@ class MainActivity : ComponentActivity() {
                     setStatus("Saving test photos\u2026")
                     val msg = try {
                         val n = writeDebugZip(st.photoJpegs(), st.describe())
-                        "Test zip saved: Download/WatchScan/$n"
+                        "Test zip saved: $n"
                     } catch (t: Throwable) {
                         "Couldn't save the test zip: ${t.message ?: t.javaClass.simpleName}"
                     }
@@ -544,9 +573,7 @@ class MainActivity : ComponentActivity() {
     private fun saveJpeg(bytes: ByteArray) {
         val name = "scan_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date()) + ".jpg"
         if (Build.VERSION.SDK_INT < 29) {
-            // Older Android: keep scans in the app's own Pictures folder (no storage permission needed).
-            val dir = getExternalFilesDir(Environment.DIRECTORY_PICTURES) ?: return
-            java.io.File(dir, name).writeBytes(bytes)
+            legacyWrite(Environment.DIRECTORY_PICTURES, name) { it.write(bytes) }
             return
         }
         val values = ContentValues().apply {
@@ -659,7 +686,7 @@ class MainActivity : ComponentActivity() {
         }
         frameCount++
         if (frameCount == 1) {
-            camDesc = "${up.cols()}x${up.rows()}, " + camDesc
+            camDesc = "${up.cols()}x${up.rows()}, " + camDesc + ", Android ${Build.VERSION.RELEASE}"
             if (mode == Mode.READY) setStatus("Camera $camDesc\nHold the watch close over the top-left of the page, tap Start, then sweep in an S")
         }
         // Cameras without continuous autofocus need a nudge every few seconds.
@@ -755,32 +782,32 @@ class MainActivity : ComponentActivity() {
     private fun writeDebugZip(photos: List<ByteArray>, summary: String): String {
         val log = synchronized(debugFiles) { debugLog.toString() } + summary + "\n"
         val name = "watchscan_test_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date()) + ".zip"
-        val out: java.io.OutputStream
-        var uri: android.net.Uri? = null
-        if (Build.VERSION.SDK_INT >= 29) {
-            val values = ContentValues().apply {
-                put(MediaStore.MediaColumns.DISPLAY_NAME, name)
-                put(MediaStore.MediaColumns.MIME_TYPE, "application/zip")
-                put(MediaStore.MediaColumns.RELATIVE_PATH, "Download/WatchScan")
-            }
-            uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
-                ?: throw java.io.IOException("the watch refused to create the file")
-            out = contentResolver.openOutputStream(uri) ?: throw java.io.IOException("couldn't open the file")
-        } else {
-            val dir = getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS) ?: throw java.io.IOException("no storage")
-            out = java.io.FileOutputStream(java.io.File(dir, name))
+        if (Build.VERSION.SDK_INT < 29) {
+            val f = legacyWrite(Environment.DIRECTORY_DOWNLOADS, name) { os -> writeZip(os, photos, log) }
+            prefs.edit().putString("last_zip_file", f.absolutePath).apply()
+            return f.absolutePath
         }
+        val values = ContentValues().apply {
+            put(MediaStore.MediaColumns.DISPLAY_NAME, name)
+            put(MediaStore.MediaColumns.MIME_TYPE, "application/zip")
+            put(MediaStore.MediaColumns.RELATIVE_PATH, "Download/WatchScan")
+        }
+        val uri: android.net.Uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+            ?: throw java.io.IOException("the watch refused to create the file")
+        val out = contentResolver.openOutputStream(uri) ?: throw java.io.IOException("couldn't open the file")
+        writeZip(out, photos, log)
+        lastZip = uri
+        prefs.edit().putString("last_zip", uri.toString()).apply()
+        return "Download/WatchScan/$name"
+    }
+
+    private fun writeZip(out: java.io.OutputStream, photos: List<ByteArray>, log: String) {
         java.util.zip.ZipOutputStream(java.io.BufferedOutputStream(out)).use { z ->
             photos.forEachIndexed { i, d ->
                 z.putNextEntry(java.util.zip.ZipEntry("%02d_photo.jpg".format(i + 1))); z.write(d); z.closeEntry()
             }
             z.putNextEntry(java.util.zip.ZipEntry("log.txt")); z.write(log.toByteArray()); z.closeEntry()
         }
-        if (uri != null) {
-            lastZip = uri
-            prefs.edit().putString("last_zip", uri.toString()).apply()
-        }
-        return name
     }
 
     private fun onInfo(info: SnapshotCollector.Info, diag: String, thumb: Bitmap?) {
