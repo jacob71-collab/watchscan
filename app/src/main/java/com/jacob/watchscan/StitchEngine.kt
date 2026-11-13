@@ -11,10 +11,12 @@ import org.opencv.core.MatOfPoint2f
 import org.opencv.core.Point
 import org.opencv.core.Scalar
 import org.opencv.core.Size
+import org.opencv.core.TermCriteria
 import org.opencv.features2d.BFMatcher
 import org.opencv.features2d.ORB
 import org.opencv.imgcodecs.Imgcodecs
 import org.opencv.imgproc.Imgproc
+import org.opencv.video.Video
 import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.min
@@ -42,6 +44,8 @@ class StitchEngine {
         const val FEAT_LONG = 960.0    // features are found on the photo resized to this long side (enlarged if smaller)
         const val THUMB_LONG = 400.0
         const val OUT_LONG = 3000
+        const val FUSE_LONG = 2400     // long side of the fused sheet (Claude reads up to 2576)
+        const val FUSE_SCALE = 2.0     // fused sheet is rendered at up to 2x the camera's resolution
     }
 
     private class Img(
@@ -77,7 +81,9 @@ class StitchEngine {
         val fs = min(1.5, FEAT_LONG / max(w, h))
         val sw = (w * fs).toInt(); val sh = (h * fs).toInt()
         val small = Mat()
-        Imgproc.resize(full, small, Size(sw.toDouble(), sh.toDouble()), 0.0, 0.0, if (fs < 1.0) Imgproc.INTER_AREA else Imgproc.INTER_CUBIC)
+        val evened = flatten(full) // shadows removed first, so shadow edges don't become "features"
+        Imgproc.resize(evened, small, Size(sw.toDouble(), sh.toDouble()), 0.0, 0.0, if (fs < 1.0) Imgproc.INTER_AREA else Imgproc.INTER_CUBIC)
+        evened.release()
         val kp = MatOfKeyPoint(); val des = Mat()
         orb.detectAndCompute(small, Mat(), kp, des)
         small.release()
@@ -422,10 +428,124 @@ class StitchEngine {
         return best?.let { PageDetector.order(it) }
     }
 
-    /** The finished sheet: joined, paper found and straightened, lighting evened out. */
+    // ------------------------------------------------------------------ multi-frame fusion
+
+    /** Weight that favours the middle of a photo over its edges. */
+    private fun centrality(w: Int, h: Int): Mat {
+        val border = Mat(h, w, CvType.CV_8UC1, Scalar(255.0))
+        Imgproc.rectangle(border, Point(0.0, 0.0), Point(w - 1.0, h - 1.0), Scalar(0.0), 1)
+        val d = Mat()
+        Imgproc.distanceTransform(border, d, Imgproc.DIST_L2, 3)
+        Core.multiply(d, Scalar(1.0 / (0.15 * min(w, h))), d)
+        Imgproc.threshold(d, d, 1.0, 1.0, Imgproc.THRESH_TRUNC)
+        Core.multiply(d, d, d)
+        Core.add(d, Scalar(1e-3), d)
+        border.release()
+        return d
+    }
+
+    /** Weight that favours well-lit parts of a photo over shadowed ones: (relative brightness)^4. */
+    private fun litWeight(src: Mat): Mat {
+        val p = max(1.0, percentile(src, 0.95))
+        val d = Mat()
+        Imgproc.dilate(src, d, Mat.ones(7, 7, CvType.CV_8U)) // ignore the text itself
+        val r = Mat()
+        d.convertTo(r, CvType.CV_32F, 1.0 / p)
+        Imgproc.threshold(r, r, 1.0, 1.0, Imgproc.THRESH_TRUNC)
+        Imgproc.GaussianBlur(r, r, Size(0.0, 0.0), 6.0)
+        Core.multiply(r, r, r); Core.multiply(r, r, r)
+        d.release()
+        return r
+    }
+
+    /** Fine-tunes each photo's placement against the joined sheet (sub-pixel), for sharp fusion. */
+    private fun refineForFusion() {
+        val b = bounds()
+        val ext = max(b[2] - b[0], b[3] - b[1])
+        if (ext > 4000) return // unusually large: skip rather than use lots of memory
+        val (ref8, rv, t1) = compose(ext.toInt() + 2, full = true)
+        rv.release()
+        val ref = Mat(); ref8.convertTo(ref, CvType.CV_32F); ref8.release()
+        val crit = TermCriteria(TermCriteria.COUNT + TermCriteria.EPS, 40, 1e-5)
+        for (id in placedH.keys.toList()) {
+            val hi = placedH[id]!!
+            val raw = Imgcodecs.imdecode(MatOfByte(*imgs[id].jpeg), Imgcodecs.IMREAD_GRAYSCALE)
+            val f8 = flatten(raw); raw.release()
+            val tmpl = Mat(); f8.convertTo(tmpl, CvType.CV_32F); f8.release()
+            val w0 = t1 * hi
+            try {
+                val warp = w0.toMat32()
+                Video.findTransformECC(tmpl, ref, warp, Video.MOTION_HOMOGRAPHY, crit, Mat(), 3)
+                val wr = H.fromMat(warp)
+                var dev = 0.0
+                val w = imgs[id].w.toDouble(); val h = imgs[id].h.toDouble()
+                for ((x, y) in listOf(0.0 to 0.0, w to 0.0, w to h, 0.0 to h)) {
+                    dev = max(dev, hypot(wr.mapX(x, y) - w0.mapX(x, y), wr.mapY(x, y) - w0.mapY(x, y)))
+                }
+                if (dev < 6.0) placedH[id] = t1.inv() * wr
+                warp.release()
+            } catch (_: Exception) {
+                // keep the feature-based placement
+            }
+            tmpl.release()
+        }
+        ref.release()
+    }
+
+    /**
+     * Blends all overlapping photos instead of picking one per spot: each spot is a weighted
+     * average of every photo that saw it, favouring well-lit and central views. Averaging
+     * many slightly shifted low-res views gives a cleaner, sharper sheet than any single photo.
+     * Returns (sheet, captured-mask, sheet-coords -> output transform).
+     */
+    private fun fuse(): Triple<Mat, Mat, H> {
+        refineForFusion()
+        val b = bounds()
+        val sc = min(FUSE_SCALE, FUSE_LONG / max(b[2] - b[0], b[3] - b[1]))
+        val w = ((b[2] - b[0]) * sc).toInt() + 1
+        val hh = ((b[3] - b[1]) * sc).toInt() + 1
+        val t = H(doubleArrayOf(sc, 0.0, -b[0] * sc, 0.0, sc, -b[1] * sc, 0.0, 0.0, 1.0))
+        val size = Size(w.toDouble(), hh.toDouble())
+        val acc = Mat.zeros(hh, w, CvType.CV_32F)
+        val ws = Mat.zeros(hh, w, CvType.CV_32F)
+        val fi = Mat(); val wi = Mat(); val prod = Mat()
+        for ((id, h) in placedH) {
+            val raw = Imgcodecs.imdecode(MatOfByte(*imgs[id].jpeg), Imgcodecs.IMREAD_GRAYSCALE)
+            val f8 = flatten(raw)
+            val f = Mat(); f8.convertTo(f, CvType.CV_32F); f8.release()
+            val cw = centrality(raw.cols(), raw.rows())
+            val lw = litWeight(raw)
+            Core.multiply(cw, lw, cw)
+            raw.release(); lw.release()
+            val m = (t * h).toMat64()
+            Imgproc.warpPerspective(f, fi, m, size, Imgproc.INTER_CUBIC)
+            Imgproc.warpPerspective(cw, wi, m, size, Imgproc.INTER_LINEAR)
+            Core.multiply(fi, wi, prod)
+            Core.add(acc, prod, acc)
+            Core.add(ws, wi, ws)
+            f.release(); cw.release(); m.release()
+        }
+        fi.release(); prod.release()
+        val valid = Mat()
+        Core.compare(ws, Scalar(1e-4), valid, Core.CMP_GT)
+        Core.max(ws, Scalar(1e-6), wi)
+        Core.divide(acc, wi, acc)
+        ws.release(); wi.release()
+        // Mild sharpening to recover detail softened by averaging.
+        val blur = Mat()
+        Imgproc.GaussianBlur(acc, blur, Size(0.0, 0.0), 1.0 * sc)
+        Core.addWeighted(acc, 1.7, blur, -0.7, 0.0, acc)
+        blur.release()
+        val out = Mat()
+        acc.convertTo(out, CvType.CV_8U)
+        acc.release()
+        return Triple(out, valid, t)
+    }
+
+    /** The finished sheet: joined, fused, paper found and straightened. */
     fun result(): Mat {
         if (placedH.isEmpty()) throw IllegalStateException("No photos could be joined.")
-        val (mos, valid, t) = compose(OUT_LONG, full = true)
+        val (mos, valid, t) = fuse()
         val (raw, rvalid, tl) = compose(800, full = false)
         var page: Array<Point>? = null
         if (Core.countNonZero(rvalid) > 0) {
